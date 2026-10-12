@@ -17,6 +17,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--format", choices=("text", "json"), default="text", dest="output_format")
     result.add_argument("--pretty", action="store_true", help="indent JSON output")
     result.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    result.add_argument("--ghidra", type=Path, metavar="EXPORT.json", help="merge deterministic metadata exported by PwnscanExport.py")
     result.add_argument("--fail-on", choices=("critical", "high", "medium", "low", "info"), help="return 3 if this severity or higher exists")
     result.add_argument("--version", action="version", version="%(prog)s " + __version__)
     return result
@@ -28,8 +29,8 @@ def main(argv=None) -> int:
         print("pwnscan: target is not a file: %s" % args.target, file=sys.stderr)
         return 2
     try:
-        report = scan_file(args.target)
-    except (OSError, ParseError) as exc:
+        report = scan_file(args.target, args.ghidra)
+    except (OSError, ParseError, ValueError) as exc:
         print("pwnscan: %s" % exc, file=sys.stderr)
         return 2
     if args.output_format == "json":

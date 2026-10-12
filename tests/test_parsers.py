@@ -33,6 +33,25 @@ def minimal_macho64(extra=b""):
     return header + extra
 
 
+def structured_elf64():
+    data = bytearray(0x340)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 2, 62, 1, 0x401000, 0, 0x200, 0, 64, 0, 0, 64, 5, 4)
+    data[0x100:0x108] = b"\x5f\xc3\x90\xc9\xc3\x90\x90\xc3"
+    data[0x120:0x12a] = b"\0win\0gets\0"
+    struct.pack_into("<IBBHQQ", data, 0x158, 1, 0x12, 0, 1, 0x401000, 8)
+    struct.pack_into("<IBBHQQ", data, 0x170, 5, 0x12, 0, 0, 0, 0)
+    names = b"\0.text\0.strtab\0.symtab\0.shstrtab\0"
+    data[0x190:0x190 + len(names)] = names
+    struct.pack_into("<IIQQQQIIQQ", data, 0x240, 1, 1, 6, 0x401000, 0x100, 8, 0, 0, 16, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x280, 7, 3, 0, 0, 0x120, 10, 0, 0, 1, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x2c0, 15, 2, 0, 0, 0x140, 72, 2, 1, 8, 24)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x300, 23, 3, 0, 0, 0x190, len(names), 0, 0, 1, 0)
+    return bytes(data)
+
+
 @pytest.mark.parametrize(
     "payload,expected",
     [(minimal_elf64(), "ELF"), (minimal_pe64(), "PE"), (minimal_macho64(), "Mach-O")],
@@ -70,3 +89,21 @@ def test_rejects_unknown_and_truncated_files():
         parse_binary(b"text")
     with pytest.raises(ParseError):
         parse_binary(b"\x7fELF")
+
+
+def test_elf_structural_symbols_imports_and_gadgets():
+    info = parse_binary(structured_elf64())
+    assert info.metadata["parsed_imports"] == ["gets"]
+    assert info.metadata["string_import_hints"] == []
+    assert info.metadata["symbol_addresses"] == {"win": 0x401000}
+    assert info.metadata["gadgets"]["pop_rdi_ret"] == [0x401000]
+    assert info.metadata["gadgets"]["leave_ret"] == [0x401003]
+
+
+def test_elf_shared_object_is_not_mislabeled_pie():
+    payload = bytearray(minimal_elf64())
+    struct.pack_into("<H", payload, 16, 3)
+    info = parse_binary(bytes(payload))
+    assert info.metadata["elf_role"] == "shared_object"
+    assert info.mitigations["pie"] is False
+    assert info.mitigations["aslr"] is True

@@ -17,16 +17,24 @@ def info(**updates):
 
 
 def test_overflow_vector_uses_mitigations():
-    findings = analyze(info(imports=["gets"], mitigations={"nx": True, "pie": False, "stack_canary": False}))
+    findings = analyze(info(
+        imports=["gets"], mitigations={"nx": True, "pie": False, "stack_canary": False},
+        metadata={"parsed_imports": ["gets"], "ghidra": {"calls": [{"from": "00401020", "function": "main", "to": "gets"}]}},
+    ))
     overflow = next(item for item in findings if item.id == "PWN-BOF-001")
     assert overflow.severity == "high"
     assert "ROP/ret2libc" in overflow.attack_vector
 
 
 def test_format_string_requires_sink_and_clue():
-    findings = analyze(info(imports=["printf"], strings=["hello %7$p", "%n"]))
+    findings = analyze(info(imports=["printf"], strings=["hello %7$p", "%n"], metadata={"parsed_imports": ["printf"]}))
     assert any(item.id == "PWN-FMT-001" for item in findings)
     assert not any(item.id == "PWN-FMT-001" for item in analyze(info(imports=["printf"])))
+
+
+def test_constant_normal_format_does_not_raise_format_finding():
+    findings = analyze(info(imports=["printf"], strings=["user: %s count: %d"], metadata={"parsed_imports": ["printf"]}))
+    assert not any(item.id == "PWN-FMT-001" for item in findings)
 
 
 def test_ret2win_clues():
@@ -49,7 +57,7 @@ def test_json_is_deterministic_and_sorted():
     decoded = json.loads(first)
     assert decoded["schema"] == "pwnscan/v1"
     ids = [item["id"] for item in decoded["findings"]]
-    assert ids[0] == "PWN-BOF-001"
+    assert "PWN-BOF-001" in ids
     assert "PWN-WIN-001" in ids
 
 
@@ -58,3 +66,12 @@ def test_text_has_vector_and_patch():
     assert "vector:" in text
     assert "patch:" in text
     assert "\x1b[" not in text
+
+
+def test_plain_api_name_is_only_low_confidence_hint():
+    finding = next(item for item in analyze(info(
+        imports=["strcpy"], metadata={"parsed_imports": [], "string_import_hints": ["strcpy"]},
+    )) if item.id == "PWN-BOF-001")
+    assert finding.severity == "low"
+    assert finding.confidence == "low"
+    assert finding.evidence == ["unverified string hint: strcpy"]

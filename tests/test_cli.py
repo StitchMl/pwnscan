@@ -14,7 +14,28 @@ def test_cli_json(tmp_path, capsys):
 def test_cli_fail_on(tmp_path):
     target = tmp_path / "challenge"
     target.write_bytes(minimal_elf64(b"gets\0"))
-    assert main([str(target), "--format", "json", "--fail-on", "high"]) == 3
+    assert main([str(target), "--format", "json", "--fail-on", "medium"]) == 3
+
+
+def test_cli_merges_valid_ghidra_export(tmp_path, capsys):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "ghidra.json"
+    export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[{"name":"win","entry":"00401100"}],"imports":["gets"],"calls":[{"from":"00401020","function":"main","to":"gets"}]}', encoding="utf-8")
+    assert main([str(target), "--ghidra", str(export), "--format", "json"]) == 0
+    output = capsys.readouterr().out
+    assert 'Ghidra reference' in output
+    assert '"confidence":"high"' in output
+    assert 'p64(0x401100)' in output
+
+
+def test_cli_rejects_malformed_ghidra_export(tmp_path, capsys):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "ghidra.json"
+    export.write_text("{}", encoding="utf-8")
+    assert main([str(target), "--ghidra", str(export)]) == 2
+    assert "invalid Ghidra export schema" in capsys.readouterr().err
 
 
 def test_cli_rejects_non_file(tmp_path, capsys):

@@ -7,11 +7,11 @@ Ghidra after the CLI ranks an input.
 2. Import the challenge and let Ghidra analyze it.
 3. Open Script Manager and run `PwnscanExport.py`.
 4. Choose an output file when Ghidra asks.
-5. Compare the export's function and import names with the CLI report.
+5. Merge the export with `pwnscan ./challenge --ghidra ./export.json`.
 
-The exporter uses Ghidra's Jython API and emits sorted JSON. It does not modify
-the program database. Ghidra versions that ship Python 3 can run the same API
-calls after minor import changes.
+The exporter uses Ghidra's Python API and emits sorted JSON. It does not modify
+the program database. The CLI validates the schema and structure before using
+functions, imports, and call references.
 
 Useful review order:
 

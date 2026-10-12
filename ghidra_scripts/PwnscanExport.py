@@ -20,10 +20,21 @@ def collect(program):
         })
 
     imports = []
+    calls = []
     symbols = program.getSymbolTable().getExternalSymbols()
     while symbols.hasNext():
         symbol = symbols.next()
         imports.append(symbol.getName(True))
+        references = program.getReferenceManager().getReferencesTo(symbol.getAddress())
+        while references.hasNext():
+            reference = references.next()
+            source = listing.getFunctionContaining(reference.getFromAddress())
+            calls.append({
+                "from": str(reference.getFromAddress()),
+                "function": source.getName() if source else None,
+                "to": symbol.getName(True),
+                "type": str(reference.getReferenceType()),
+            })
 
     return {
         "schema": "pwnscan-ghidra/v1",
@@ -32,6 +43,7 @@ def collect(program):
         "image_base": str(program.getImageBase()),
         "functions": sorted(functions, key=lambda item: (item["name"].lower(), item["entry"])),
         "imports": sorted(set(imports), key=lambda value: (value.lower(), value)),
+        "calls": sorted(calls, key=lambda item: (item["to"].lower(), item["from"])),
     }
 
 

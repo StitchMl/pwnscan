@@ -37,13 +37,17 @@ pwnscan ./challenge --fail-on high
 `--fail-on` returns exit code `3` when the report contains the selected
 severity or a higher one. Parse and input errors return `2`.
 
-The current rules cover:
+The current engine covers:
 
-- unbounded copies and reads that may provide a stack or heap overwrite;
-- attacker-controlled format-string candidates;
-- command execution sinks;
-- `win`, `print_flag`, shell, and flag clues;
-- missing NX, canary, PIE/ASLR, RELRO, and CFG signals.
+- parsed imports, undefined ELF symbols, exported functions, and string hints as separate evidence classes;
+- ELF gadgets, useful-string addresses, RWX sections, symbol addresses, PIE versus DSO, and RELRO state;
+- PE import tables, ASLR, DEP, CFG, and RWX sections;
+- unbounded writes, format-string targets, command sinks, ret2win paths, and mitigation gaps;
+- computed `p32`/`p64` ret2win scaffolds when a symbol address exists.
+
+An isolated API name inside arbitrary data remains a low-confidence hint. High
+confidence requires structural evidence, such as an import plus a Ghidra call
+reference.
 
 `pwnscan` derives findings from file contents. It does not use file names,
 paths, network services, an LLM, or challenge-specific signatures. Reports
@@ -61,9 +65,14 @@ review after triage; embedding the whole scanner in Ghidra would weaken CLI
 portability and complicate deterministic testing.
 
 [`ghidra_scripts/PwnscanExport.py`](ghidra_scripts/PwnscanExport.py) exports
-Ghidra symbols, functions, and imports to deterministic JSON. Run it from
-Ghidra's Script Manager after analysis. Pass the JSON to your own correlation
-workflow or inspect it beside `pwnscan --format json` output. See
+Ghidra symbols, functions, imports, and call references to deterministic JSON.
+Run it from Ghidra's Script Manager after analysis, then merge it directly:
+
+```console
+pwnscan ./challenge --ghidra ./challenge.ghidra.json
+```
+
+See
 [`docs/ghidra.md`](docs/ghidra.md).
 
 ## Tests
@@ -79,4 +88,5 @@ binaries.
 ## Scope and safety
 
 Use this tool for CTF challenges, labs, and systems you may test. `pwnscan`
-does not generate weaponized payloads, connect to targets, or execute code.
+does not connect to targets or execute target code. Generated scaffolds contain
+only addresses derived from the supplied artifact and require manual validation.

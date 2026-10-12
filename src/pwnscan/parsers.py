@@ -97,7 +97,9 @@ def parse_elf(data: bytes) -> BinaryInfo:
 
     nx: Optional[bool] = None
     relro = False
+    bind_now = False
     dynamic = False
+    has_interp = False
     for index in range(min(phnum, 4096)):
         off = phoff + index * phentsize
         if off + phentsize > len(data) or phentsize == 0:
@@ -113,19 +115,41 @@ def parse_elf(data: bytes) -> BinaryInfo:
             relro = True
         elif p_type == 2:
             dynamic = True
+            dyn_off = _u(data, off + (8 if bits == 64 else 4), "Q" if bits == 64 else "I", endian_char)
+            dyn_size = _u(data, off + (32 if bits == 64 else 16), "Q" if bits == 64 else "I", endian_char)
+            stride = 16 if bits == 64 else 8
+            for dyn_at in range(dyn_off, min(len(data), dyn_off + dyn_size), stride):
+                if dyn_at + stride > len(data):
+                    break
+                tag = _u(data, dyn_at, "Q" if bits == 64 else "I", endian_char)
+                value = _u(data, dyn_at + stride // 2, "Q" if bits == 64 else "I", endian_char)
+                if tag == 0:
+                    break
+                bind_now = bind_now or tag == 24 or (tag == 30 and bool(value & 8)) or (tag == 0x6FFFFFFB and bool(value & 1))
+        elif p_type == 3:
+            has_interp = True
 
     sections = _elf_sections(data, bits, endian_char, shoff, shentsize, shnum, shstrndx)
-    symbols = _elf_symbols(data, bits, endian_char, sections)
+    symbols, symbol_addresses, undefined_symbols = _elf_symbols(data, bits, endian_char, sections)
     values = extract_strings(data)
-    imports = sorted(set(_interesting_names(values)) | {name for name in symbols if name in INTERESTING_APIS}, key=str.lower)
+    parsed_imports = sorted({name for name in undefined_symbols if name in INTERESTING_APIS}, key=str.lower)
+    string_hints = sorted(set(_interesting_names(values)) - set(parsed_imports), key=str.lower)
+    imports = sorted(set(parsed_imports) | set(string_hints), key=str.lower)
     stack_canary = any(name in {"__stack_chk_fail", "__stack_chk_guard"} for name in symbols) or b"__stack_chk_fail" in data
-    pie = e_type == 3
+    pie = e_type == 3 and has_interp
+    relro_state = "full" if relro and bind_now else ("partial" if relro else "none")
     return BinaryInfo(
         format="ELF", bits=bits, endian=endian,
         architecture=ELF_MACHINES.get(machine, "machine-%d" % machine),
         entrypoint=entry, imports=imports, symbols=symbols, strings=values,
-        mitigations={"nx": nx, "pie": pie, "stack_canary": stack_canary, "relro": relro or None, "aslr": pie},
-        metadata={"elf_type": e_type, "dynamic": dynamic, "sections": sorted(sections)},
+        mitigations={"nx": nx, "pie": pie, "stack_canary": stack_canary, "relro": relro, "aslr": e_type == 3},
+        metadata={
+            "elf_type": e_type, "elf_role": "pie" if pie else ("shared_object" if e_type == 3 else "executable"),
+            "dynamic": dynamic, "relro": relro_state, "sections": sorted(sections),
+            "parsed_imports": parsed_imports, "string_import_hints": string_hints,
+            "symbol_addresses": symbol_addresses,
+            **_elf_exploit_metadata(data, bits, endian_char, sections, ELF_MACHINES.get(machine, "")),
+        },
     )
 
 
@@ -156,8 +180,10 @@ def _elf_sections(data: bytes, bits: int, endian: str, shoff: int, entsize: int,
     return result
 
 
-def _elf_symbols(data: bytes, bits: int, endian: str, sections: Dict[str, Tuple[int, int, int, int]]) -> List[str]:
+def _elf_symbols(data: bytes, bits: int, endian: str, sections: Dict[str, Tuple[int, int, int, int]]) -> Tuple[List[str], Dict[str, int], List[str]]:
     result = set()
+    addresses: Dict[str, int] = {}
+    undefined = set()
     section_list = list(sections.items())
     for _, (kind, offset, size, packed) in section_list:
         if kind not in {2, 11}:
@@ -178,7 +204,68 @@ def _elf_symbols(data: bytes, bits: int, endian: str, sections: Dict[str, Tuple[
             name = _c_string(strings, name_at)
             if name:
                 result.add(name)
-    return sorted(result, key=lambda value: (value.lower(), value))
+                value = _u(data, at + (8 if bits == 64 else 4), "Q" if bits == 64 else "I", endian)
+                section_index = _u(data, at + (6 if bits == 64 else 14), "H", endian)
+                if value and (name not in addresses or value < addresses[name]):
+                    addresses[name] = value
+                if section_index == 0:
+                    undefined.add(name)
+    return (
+        sorted(result, key=lambda value: (value.lower(), value)),
+        {name: addresses[name] for name in sorted(addresses, key=str.lower)},
+        sorted(undefined, key=str.lower),
+    )
+
+
+def _elf_exploit_metadata(data: bytes, bits: int, endian: str, sections: Dict[str, Tuple[int, int, int, int]], architecture: str) -> Dict[str, object]:
+    """Extract address-bearing facts from sections without executing the target."""
+    result: Dict[str, object] = {"rwx_sections": [], "gadgets": {}, "useful_strings": {}}
+    if architecture not in {"x86", "x86_64"}:
+        return result
+    patterns = {"ret": b"\xc3", "leave_ret": b"\xc9\xc3", "jmp_rsp": b"\xff\xe4", "syscall_ret": b"\x0f\x05\xc3"}
+    if bits == 64:
+        patterns.update({"pop_rdi_ret": b"\x5f\xc3", "pop_rsi_ret": b"\x5e\xc3", "pop_rdx_ret": b"\x5a\xc3"})
+    gadgets: Dict[str, List[int]] = {name: [] for name in patterns}
+    useful: Dict[str, List[int]] = {"/bin/sh": []}
+    rwx: List[str] = []
+    if bits == 64:
+        shoff, entsize, count = _u(data, 40, "Q", endian), _u(data, 58, "H", endian), _u(data, 60, "H", endian)
+    else:
+        shoff, entsize, count = _u(data, 32, "I", endian), _u(data, 46, "H", endian), _u(data, 48, "H", endian)
+    indexed = list(sections.items())
+    for index in range(min(count, len(indexed))):
+        at = shoff + index * entsize
+        minimum = 64 if bits == 64 else 40
+        if entsize < minimum or at + minimum > len(data):
+            break
+        if bits == 64:
+            flags, va, file_at, size = (_u(data, at + 8, "Q", endian), _u(data, at + 16, "Q", endian), _u(data, at + 24, "Q", endian), _u(data, at + 32, "Q", endian))
+        else:
+            flags, va, file_at, size = (_u(data, at + 8, "I", endian), _u(data, at + 12, "I", endian), _u(data, at + 16, "I", endian), _u(data, at + 20, "I", endian))
+        name = indexed[index][0]
+        blob = data[file_at:min(len(data), file_at + size)]
+        if flags & 1 and flags & 4:
+            rwx.append(name)
+        if flags & 4:
+            for label, needle in patterns.items():
+                start = 0
+                while len(gadgets[label]) < 8:
+                    found = blob.find(needle, start)
+                    if found < 0:
+                        break
+                    gadgets[label].append(va + found)
+                    start = found + 1
+        start = 0
+        while len(useful["/bin/sh"]) < 4:
+            found = blob.find(b"/bin/sh\0", start)
+            if found < 0:
+                break
+            useful["/bin/sh"].append(va + found)
+            start = found + 1
+    result["rwx_sections"] = sorted(rwx, key=str.lower)
+    result["gadgets"] = {name: values for name, values in sorted(gadgets.items()) if values}
+    result["useful_strings"] = {name: values for name, values in sorted(useful.items()) if values}
+    return result
 
 
 PE_MACHINES = {0x14C: "x86", 0x8664: "x86_64", 0x1C0: "arm", 0xAA64: "aarch64"}
@@ -253,8 +340,10 @@ def parse_pe(data: bytes) -> BinaryInfo:
                     if name:
                         imports.add(name)
             descriptor += 20
+    parsed_imports = sorted(imports, key=str.lower)
     values = extract_strings(data)
-    imports.update(_interesting_names(values))
+    string_hints = sorted(set(_interesting_names(values)) - set(parsed_imports), key=str.lower)
+    imports.update(string_hints)
     nx = bool(dll_chars & 0x0100)
     aslr = bool(dll_chars & 0x0040)
     cfg = bool(dll_chars & 0x4000)
@@ -264,7 +353,11 @@ def parse_pe(data: bytes) -> BinaryInfo:
         entrypoint=image_base + entry_rva, image_base=image_base,
         imports=sorted(imports, key=str.lower), symbols=[], strings=values,
         mitigations={"nx": nx, "aslr": aslr, "cfg": cfg, "stack_canary": None, "writable_executable": writable_executable},
-        metadata={"dll": bool(characteristics & 0x2000), "sections": sorted(section[0] for section in sections)},
+        metadata={
+            "dll": bool(characteristics & 0x2000), "sections": sorted(section[0] for section in sections),
+            "parsed_imports": parsed_imports, "string_import_hints": string_hints,
+            "rwx_sections": sorted(section[0] for section in sections if (section[5] & 0x80000000) and (section[5] & 0x20000000)),
+        },
     )
 
 
@@ -314,5 +407,9 @@ def parse_macho(data: bytes) -> BinaryInfo:
         architecture=MACH_CPU.get(cpu, "cpu-%d" % cpu), entrypoint=entry,
         imports=imports, symbols=[], strings=values,
         mitigations={"nx": not executable_stack, "pie": pie, "aslr": pie, "stack_canary": b"___stack_chk_fail" in data},
-        metadata={"file_type": file_type, "dylibs": sorted(set(dylibs), key=str.lower)},
+        metadata={
+            "file_type": file_type, "dylibs": sorted(set(dylibs), key=str.lower),
+            "parsed_imports": [], "string_import_hints": imports,
+            "rwx_sections": ["__UNIXSTACK"] if executable_stack else [],
+        },
     )
