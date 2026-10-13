@@ -25,7 +25,8 @@ Set `PYTHONPATH=src` for the second form when running from a checkout.
 ## Output
 
 Text output includes binary metadata, mitigations, evidence, an attack vector,
-validation steps, and a defensive patch. JSON output uses the stable
+an exploit-readiness state, a flag path, validation steps, and a defensive
+patch. JSON output uses the stable
 `pwnscan/v1` schema.
 
 ```console
@@ -43,7 +44,8 @@ The current engine covers:
 - ELF gadgets, useful-string addresses, RWX sections, symbol addresses, PIE versus DSO, and RELRO state;
 - PE import tables, ASLR, DEP, CFG, and RWX sections;
 - unbounded writes, format-string targets, command sinks, ret2win paths, and mitigation gaps;
-- computed `p32`/`p64` ret2win scaffolds when a symbol address exists.
+- an exact ret2win payload when Ghidra proves the saved-return offset, input
+  capacity, fixed target address, and absence of a stack canary.
 
 An isolated API name inside arbitrary data remains a low-confidence hint. High
 confidence requires structural evidence, such as an import plus a Ghidra call
@@ -55,8 +57,9 @@ sort maps, symbols, strings, evidence, and findings before serialization. The
 target path appears in the report for operator context, so it is the only
 path-dependent field.
 
-Static evidence does not prove exploitability. Use each finding as a debugger
-and decompiler worklist inside the authorized CTF environment.
+`payload-ready` is reserved for a complete static exploit chain with exact
+bytes and a flag-path function. Every incomplete hypothesis is marked
+`validation-only`; the scanner does not invent offsets or addresses.
 
 ## Ghidra
 
@@ -64,13 +67,27 @@ The CLI remains the primary interface. Ghidra improves call-site and data-flow
 review after triage; embedding the whole scanner in Ghidra would weaken CLI
 portability and complicate deterministic testing.
 
-[`ghidra_scripts/PwnscanExport.py`](ghidra_scripts/PwnscanExport.py) exports
-Ghidra symbols, functions, imports, and call references to deterministic JSON.
-Run it from Ghidra's Script Manager after analysis, then merge it directly:
+[`ghidra_scripts/PwnscanExport.java`](ghidra_scripts/PwnscanExport.java) exports
+Ghidra symbols, functions, imports, call arguments, stack-buffer sizes, and
+P-code call references to deterministic JSON. The Python variant is retained
+for PyGhidra installations. Run either exporter after analysis, then merge it:
 
 ```console
 pwnscan ./challenge --ghidra ./challenge.ghidra.json
 ```
+
+If Ghidra is installed, the CLI can create an isolated temporary project,
+run headless analysis, merge the result, and remove the project:
+
+```console
+pwnscan ./challenge --ghidra-auto --ghidra-home C:\Tools\ghidra_12.0_PUBLIC
+```
+
+Set `GHIDRA_HOME` instead of passing `--ghidra-home`. `--ghidra-timeout`
+limits analysis time. Ghidra reads and decompiles the target; it never runs it.
+Recovered P-code arguments let `pwnscan` prove constant-size stack overwrites,
+compute saved-return offsets, reject constant `printf("%s", value)` calls, and
+rank dynamic command arguments.
 
 See
 [`docs/ghidra.md`](docs/ghidra.md).

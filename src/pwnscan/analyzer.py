@@ -15,12 +15,88 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s"}
 FORMAT_SINKS = {"printf", "fprintf", "syslog"}
 COMMAND_SINKS = {"system", "popen", "execve", "WinExec", "CreateProcess"}
+BOUNDED_WRITES = {
+    "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2),
+    "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2),
+}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
 
 
-def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str) -> Finding:
-    return Finding(identity, title, severity, confidence, sorted(set(evidence), key=str.lower), vector, list(validation), patch)
+def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = "Manual confirmation required before a flag-recovery payload exists.") -> Finding:
+    return Finding(identity, title, severity, confidence, sorted(set(evidence), key=str.lower), vector, list(validation), patch, exploit_status, flag_path)
+
+
+def _call_name(call: dict) -> str:
+    return str(call.get("to") or "").rsplit("::", 1)[-1].lstrip("_")
+
+
+def _call_argument(call: dict, index: int) -> dict:
+    arguments = call.get("arguments")
+    if not isinstance(arguments, list) or index >= len(arguments) or not isinstance(arguments[index], dict):
+        return {}
+    return arguments[index]
+
+
+def _dynamic_argument(argument: dict) -> bool:
+    return argument.get("kind") in {"dynamic", "stack"}
+
+
+def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
+    result = []
+    for call in calls:
+        name = _call_name(call)
+        if name not in BOUNDED_WRITES:
+            continue
+        destination_index, length_index = BOUNDED_WRITES[name]
+        destination = _call_argument(call, destination_index)
+        length = _call_argument(call, length_index)
+        buffer_size = destination.get("buffer_size")
+        requested = length.get("value") if length.get("kind") == "constant" else None
+        if isinstance(buffer_size, int) and buffer_size > 0 and isinstance(requested, int) and requested > buffer_size:
+            result.append({"call": call, "name": name, "buffer_size": buffer_size, "requested": requested, "destination": destination})
+    return result
+
+
+def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Sequence[str], symbol_addresses: dict) -> Finding | None:
+    address_key = "pie" if info.format in {"ELF", "Mach-O"} else "aslr"
+    if info.mitigations.get("stack_canary") is not False or info.mitigations.get(address_key) is not False:
+        return None
+    if info.bits not in {32, 64} or info.endian not in {"little", "big"}:
+        return None
+    addressed = [(name, symbol_addresses.get(name)) for name in win_symbols]
+    addressed = [(name, address) for name, address in addressed if isinstance(address, int) and address > 0]
+    if not addressed:
+        return None
+    chosen_name, chosen_address = addressed[0]
+    pointer_size = info.bits // 8
+    for item in bounded:
+        return_offset = item["destination"].get("return_address_offset")
+        if not isinstance(return_offset, int) or return_offset <= 0:
+            continue
+        if item["requested"] < return_offset + pointer_size:
+            continue
+        payload = (b"A" * return_offset) + chosen_address.to_bytes(pointer_size, info.endian)
+        call = item["call"]
+        payload_hex = payload.hex()
+        return _finding(
+            "PWN-FLAG-CHAIN-001", "Verified direct flag-path overwrite", "critical", "high",
+            [
+                "Ghidra recovered saved return address offset %d for %s at %s" % (return_offset, item["name"], call.get("from")),
+                "fixed %s address: 0x%x" % (chosen_name, chosen_address),
+                "stack canary disabled; %s disabled" % address_key,
+            ],
+            "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s."
+            % (payload_hex, payload_hex, item["name"], call.get("from")),
+            [
+                "Run only against the authorized challenge instance.",
+                "Confirm execution reaches %s and capture its flag output." % chosen_name,
+            ],
+            "Bound the write to the destination capacity and enable stack canaries plus position-independent code.",
+            "payload-ready",
+            "The payload overwrites the saved return address with %s (0x%x), the statically identified flag path." % (chosen_name, chosen_address),
+        )
+    return None
 
 
 def analyze(info: BinaryInfo) -> List[Finding]:
@@ -31,6 +107,26 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     symbol_addresses = info.metadata.get("symbol_addresses", {})
     ghidra_calls = info.metadata.get("ghidra", {}).get("calls", [])
     findings: List[Finding] = []
+
+    bounded = _bounded_overflows(ghidra_calls)
+    if bounded:
+        evidence = []
+        validation = []
+        for item in bounded:
+            call = item["call"]
+            variable = item["destination"].get("variable") or "stack destination"
+            delta = item["requested"] - item["buffer_size"]
+            evidence.append(
+                "Ghidra call %s at %s in %s writes up to %d bytes into %s (%d bytes); overflow window %d bytes"
+                % (item["name"], call.get("from"), call.get("function") or "<unknown>", item["requested"], variable, item["buffer_size"], delta)
+            )
+            validation.append("Send exactly %d non-newline bytes to the input reaching %s and confirm saved-state corruption in a debugger." % (item["requested"], call.get("from")))
+        findings.append(_finding(
+            "PWN-BOUNDS-001", "Proven constant-length stack overwrite", "critical", "high", evidence,
+            "The decompiler recovered a destination smaller than the requested write. Use a cyclic pattern of the reported request length, measure the saved-state offset, then select ret2win or ROP from the reported mitigations and addresses.",
+            validation,
+            "Cap each write at the recovered destination size minus required terminator space and reject larger input before the call.",
+        ))
 
     dangerous = sorted(imports & set(UNBOUNDED), key=str.lower)
     if dangerous:
@@ -58,7 +154,24 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     format_evidence = sorted(imports & FORMAT_SINKS, key=str.lower)
     format_clues = sorted(value for value in info.strings if "%n" in value or re.search(r"%\d+\$[pxsn]", value))[:8]
     parsed_format = sorted(set(format_evidence) & parsed_imports, key=str.lower)
-    if parsed_format and format_clues:
+    dynamic_format_calls = []
+    format_indexes = {"printf": 0, "fprintf": 1, "syslog": 1}
+    for call in ghidra_calls:
+        name = _call_name(call)
+        if name in format_indexes and _dynamic_argument(_call_argument(call, format_indexes[name])):
+            dynamic_format_calls.append(call)
+    if dynamic_format_calls:
+        call_evidence = [
+            "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to"))
+            for item in dynamic_format_calls
+        ]
+        findings.append(_finding(
+            "PWN-FMT-001", "Attacker-reachable dynamic format candidate", "high", "high", call_evidence,
+            "Send `%p.%p.%p` to confirm pointer disclosure. If the same input reaches `%n`, use a positional write only after mapping the argument index in the isolated CTF runner.",
+            ["Compare output for a literal marker and `%p.%p.%p`.", "Confirm the decompiled format argument comes from challenge input."],
+            "Pass a constant format such as `%s` and move the dynamic value to a separate argument.",
+        ))
+    elif parsed_format and format_clues:
         findings.append(_finding(
             "PWN-FMT-001", "Format-string review required", "medium", "low",
             ["parsed format sink: %s" % item for item in parsed_format] + ["format token in binary: %s" % item for item in format_clues],
@@ -68,17 +181,32 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         ))
 
     commands = sorted(parsed_imports & COMMAND_SINKS, key=str.lower)
-    if commands:
+    dynamic_command_calls = [
+        item for item in ghidra_calls
+        if _call_name(item) in COMMAND_SINKS and _dynamic_argument(_call_argument(item, 0))
+    ]
+    if dynamic_command_calls:
         findings.append(_finding(
-            "PWN-CMD-001", "Command execution sink", "medium", "medium",
-            ["command sink: %s" % name for name in commands],
-            "Trace user-controlled strings into the command argument. Inject a separator or replace an argument to read the flag if the challenge lacks filtering.",
-            ["Inspect string construction before the sink.", "Record quoting and the invoked shell or process API."],
+            "PWN-CMD-001", "Dynamic command execution candidate", "high", "high",
+            ["dynamic command at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in dynamic_command_calls],
+            "The decompiler recovered a non-constant command argument. Preserve the known prefix and test a shell separator followed by `cat /flag` only inside the authorized challenge runner.",
+            ["Inspect how input reaches the command argument.", "Record quoting, allowlists and the invoked shell before choosing a separator."],
             "Avoid shell command construction. Use fixed executable paths and validated argument arrays.",
+        ))
+    elif commands:
+        findings.append(_finding(
+            "PWN-CMD-001", "Command execution sink requires data-flow review", "low", "low",
+            ["parsed command sink without proven dynamic argument: %s" % name for name in commands],
+            "Inspect the command argument. Build a flag-read probe only if challenge input reaches it after quoting and validation.",
+            ["Decompile the sink call and trace argument zero."],
+            "Keep the executable and argument vector constant or validate each token against an allowlist.",
         ))
 
     win_symbols = sorted(name for name in symbols if WIN_NAMES.search(name))
     win_strings = sorted((value for value in info.strings if FLAG_TEXT.search(value)), key=str.lower)[:12]
+    exact_chain = _exact_ret2win(info, bounded, win_symbols, symbol_addresses)
+    if exact_chain is not None:
+        findings.append(exact_chain)
     if win_symbols or win_strings:
         addressed = [(name, symbol_addresses[name]) for name in win_symbols if name in symbol_addresses]
         if addressed:

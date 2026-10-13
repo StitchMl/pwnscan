@@ -31,7 +31,12 @@ def render_text(report: ScanReport, color: bool = False) -> str:
         label = "[%s] %s %s" % (finding.severity.upper(), finding.id, finding.title)
         if color:
             label = COLORS[finding.severity] + label + RESET
-        lines.extend([label, "  confidence: %s" % finding.confidence])
+        lines.extend([
+            label,
+            "  confidence: %s" % finding.confidence,
+            "  exploit: %s" % finding.exploit_status,
+            "  flag path: %s" % finding.flag_path,
+        ])
         for evidence in finding.evidence:
             lines.append("  evidence: %s" % evidence)
         lines.append("  vector: %s" % finding.attack_vector)

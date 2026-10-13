@@ -29,6 +29,8 @@ class Finding:
     attack_vector: str
     validation: List[str]
     patch: str
+    exploit_status: str = "validation-only"
+    flag_path: str = "Manual confirmation required before a flag-recovery payload exists."
 
 
 @dataclass(frozen=True)

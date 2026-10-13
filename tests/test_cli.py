@@ -38,6 +38,33 @@ def test_cli_rejects_malformed_ghidra_export(tmp_path, capsys):
     assert "invalid Ghidra export schema" in capsys.readouterr().err
 
 
+def test_cli_runs_optional_headless_export(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "generated.json"
+    export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[],"imports":[],"calls":[]}', encoding="utf-8")
+    calls = []
+
+    def fake_export(actual_target, home, script, timeout):
+        calls.append((actual_target, home, script, timeout))
+        return export
+
+    monkeypatch.setattr("pwnscan.cli.export_headless", fake_export)
+    assert main([str(target), "--ghidra-auto", "--ghidra-timeout", "19", "--format", "json"]) == 0
+    assert calls == [(target, None, None, 19)]
+    assert not export.exists()
+    assert '"schema":"pwnscan/v1"' in capsys.readouterr().out
+
+
+def test_cli_rejects_two_ghidra_sources(tmp_path, capsys):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "manual.json"
+    export.write_text("{}", encoding="utf-8")
+    assert main([str(target), "--ghidra", str(export), "--ghidra-auto"]) == 2
+    assert "choose either --ghidra or --ghidra-auto" in capsys.readouterr().err
+
+
 def test_cli_rejects_non_file(tmp_path, capsys):
     assert main([str(tmp_path / "missing")]) == 2
     assert "target is not a file" in capsys.readouterr().err
