@@ -1,3 +1,3 @@
 """Deterministic offline binary triage for CTF challenges."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

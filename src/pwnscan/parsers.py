@@ -18,6 +18,7 @@ INTERESTING_APIS = (
     "fscanf", "read", "recv", "memcpy", "printf", "fprintf", "syslog",
     "system", "popen", "execve", "mprotect", "VirtualProtect", "WinExec",
     "CreateProcess", "LoadLibrary", "GetProcAddress",
+    "malloc", "calloc", "realloc", "free", "operator new", "operator delete",
 )
 
 

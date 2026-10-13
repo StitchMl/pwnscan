@@ -180,3 +180,79 @@ def test_plain_api_name_is_only_low_confidence_hint():
     assert finding.severity == "low"
     assert finding.confidence == "low"
     assert finding.evidence == ["unverified string hint: strcpy"]
+
+
+def expression(op, *inputs):
+    return {"op": op, "size": 8, "inputs": list(inputs)}
+
+
+def dynamic(name, operation=None):
+    value = {"kind": "dynamic", "repr": name, "high_name": name, "size": 8}
+    if operation is not None:
+        value["expression"] = operation
+    return value
+
+
+def test_arithmetic_allocation_size_is_reported_without_claiming_payload_ready():
+    count = dynamic("count", expression("INT_MULT", {"kind": "dynamic", "repr": "count", "size": 4}, {"kind": "constant", "value": 48, "size": 4}))
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401200", "function": "load", "to": "malloc", "arguments": [count]},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-INT-001")
+    assert finding.confidence == "medium"
+    assert finding.exploit_status == "validation-only"
+    assert "SIZE_MAX" in finding.patch
+
+
+def test_plain_dynamic_allocation_size_is_not_integer_overflow():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401200", "function": "load", "to": "malloc", "arguments": [dynamic("size")]},
+    ]}}))
+    assert not any(item.id == "PWN-INT-001" for item in findings)
+
+
+def test_width_conversion_in_write_length_is_reported():
+    length = dynamic("signed_length", expression("INT_SEXT", {"kind": "dynamic", "repr": "input_length", "size": 4}))
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401300", "function": "copy", "to": "memcpy", "arguments": [dynamic("dst"), dynamic("src"), length]},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-SIGN-001")
+    assert finding.confidence == "medium"
+    assert "-1" in finding.attack_vector
+
+
+def test_repeated_free_and_post_free_write_are_distinct_findings():
+    pointer = dynamic("entry")
+    calls = [
+        {"from": "00401010", "function": "edit", "to": "free", "arguments": [pointer]},
+        {"from": "00401020", "function": "edit", "to": "read", "arguments": [{"kind": "constant", "value": 0}, pointer, {"kind": "constant", "value": 16}]},
+        {"from": "00401030", "function": "edit", "to": "free", "arguments": [pointer]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    ids = {item.id for item in findings}
+    assert {"PWN-HEAP-001", "PWN-HEAP-002"} <= ids
+    assert all(item.exploit_status == "validation-only" for item in findings if item.id.startswith("PWN-HEAP"))
+
+
+def test_separate_pointer_identities_do_not_raise_heap_lifetime_finding():
+    calls = [
+        {"from": "00401010", "function": "edit", "to": "free", "arguments": [dynamic("old_entry")]},
+        {"from": "00401020", "function": "edit", "to": "read", "arguments": [{"kind": "constant", "value": 0}, dynamic("new_entry"), {"kind": "constant", "value": 16}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    assert not any(item.id.startswith("PWN-HEAP") for item in findings)
+
+
+def test_stack_derived_indirect_call_is_high_confidence_but_not_payload_ready():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401400", "function": "dispatch", "to": None, "indirect": True,
+         "target": {"kind": "stack", "stack_offset": -32, "high_name": "callback"}, "arguments": []},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-CFLOW-001")
+    assert finding.confidence == "high"
+    assert finding.exploit_status == "validation-only"
+
+
+def test_partial_relro_is_reported_as_missing_full_relro():
+    finding = next(item for item in analyze(info(metadata={"relro": "partial"})) if item.id == "PWN-MIT-001")
+    assert "full_relro disabled" in finding.evidence

@@ -19,6 +19,13 @@ BOUNDED_WRITES = {
     "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2),
     "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2),
 }
+DEALLOCATORS = {"free", "operator delete", "delete"}
+HEAP_DEREFERENCE_ARGUMENTS = {
+    "read": {1}, "recv": {1}, "recvfrom": {1}, "memcpy": {0, 1},
+    "memmove": {0, 1}, "strcpy": {0, 1}, "strcat": {0, 1},
+}
+ARITHMETIC_WRAP_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT", "INT_SUB"}
+WIDTH_CHANGE_OPS = {"INT_SEXT"}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
 
@@ -40,6 +47,77 @@ def _call_argument(call: dict, index: int) -> dict:
 
 def _dynamic_argument(argument: dict) -> bool:
     return argument.get("kind") in {"dynamic", "stack"}
+
+
+def _expression_ops(argument: dict) -> set[str]:
+    result: set[str] = set()
+    pending = [argument.get("expression")]
+    while pending:
+        expression = pending.pop()
+        if not isinstance(expression, dict):
+            continue
+        operation = expression.get("op")
+        if isinstance(operation, str):
+            result.add(operation)
+        inputs = expression.get("inputs")
+        if isinstance(inputs, list):
+            pending.extend(inputs)
+    return result
+
+
+def _argument_identity(argument: dict) -> str | None:
+    high_name = argument.get("high_name")
+    if isinstance(high_name, str) and high_name and high_name not in {"UNNAMED", "null"}:
+        return "high:%s" % high_name
+    stack_offset = argument.get("stack_offset")
+    if isinstance(stack_offset, int):
+        return "stack:%d" % stack_offset
+    representation = argument.get("repr")
+    if isinstance(representation, str) and representation and argument.get("kind") != "constant":
+        return "repr:%s" % representation
+    return None
+
+
+def _call_position(call: dict) -> tuple[str, int, str]:
+    value = str(call.get("from") or "")
+    try:
+        numeric = int(value, 16)
+    except ValueError:
+        numeric = 0
+    return str(call.get("function") or ""), numeric, value
+
+
+def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[str]]:
+    double_free: list[str] = []
+    use_after_free: list[str] = []
+    freed: dict[tuple[str, str], dict] = {}
+    for call in sorted(calls, key=_call_position):
+        function = str(call.get("function") or "<unknown>")
+        name = _call_name(call)
+        if name in DEALLOCATORS:
+            identity = _argument_identity(_call_argument(call, 0))
+            if identity is None:
+                continue
+            key = function, identity
+            previous = freed.get(key)
+            if previous is not None:
+                double_free.append(
+                    "%s frees %s at %s after an earlier free at %s"
+                    % (function, identity, call.get("from"), previous.get("from"))
+                )
+            else:
+                freed[key] = call
+            continue
+        indexes = HEAP_DEREFERENCE_ARGUMENTS.get(name, set())
+        for index in indexes:
+            identity = _argument_identity(_call_argument(call, index))
+            previous = freed.get((function, identity or ""))
+            if previous is not None:
+                use_after_free.append(
+                    "%s passes freed %s to %s argument %d at %s; free at %s"
+                    % (function, identity, name, index, call.get("from"), previous.get("from"))
+                )
+    return sorted(set(double_free), key=str.lower), sorted(set(use_after_free), key=str.lower)
 
 
 def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
@@ -126,6 +204,92 @@ def analyze(info: BinaryInfo) -> List[Finding]:
             "The decompiler recovered a destination smaller than the requested write. Use a cyclic pattern of the reported request length, measure the saved-state offset, then select ret2win or ROP from the reported mitigations and addresses.",
             validation,
             "Cap each write at the recovered destination size minus required terminator space and reject larger input before the call.",
+        ))
+
+    arithmetic_allocations = []
+    allocation_indexes = {"malloc": {0}, "calloc": {0, 1}, "realloc": {1}, "operator new": {0}, "new": {0}}
+    for call in ghidra_calls:
+        name = _call_name(call)
+        for index in allocation_indexes.get(name, set()):
+            argument = _call_argument(call, index)
+            operations = _expression_ops(argument)
+            if operations & ARITHMETIC_WRAP_OPS:
+                arithmetic_allocations.append((call, index, sorted(operations & ARITHMETIC_WRAP_OPS)))
+    if arithmetic_allocations:
+        evidence = [
+            "Ghidra traces %s argument %d at %s through %s"
+            % (_call_name(call), index, call.get("from"), ", ".join(operations))
+            for call, index, operations in arithmetic_allocations
+        ]
+        findings.append(_finding(
+            "PWN-INT-001", "Wrap-prone arithmetic controls an allocation size", "medium", "medium", evidence,
+            "Drive the reported count or element size toward the integer-width boundary. Confirm allocation wraps smaller than the later initialized element count before deriving a heap-overflow payload.",
+            ["Recover operand widths and input bounds in the decompiler.", "Break on the allocator and compare the requested byte count with the following write volume."],
+            "Reject operands above SIZE_MAX / element_size before multiplication and above SIZE_MAX - increment before addition.",
+        ))
+
+    width_changed_lengths = []
+    for call in ghidra_calls:
+        name = _call_name(call)
+        if name not in BOUNDED_WRITES:
+            continue
+        _, length_index = BOUNDED_WRITES[name]
+        operations = _expression_ops(_call_argument(call, length_index))
+        if operations & WIDTH_CHANGE_OPS:
+            width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
+    if width_changed_lengths:
+        findings.append(_finding(
+            "PWN-SIGN-001", "Width or signedness conversion controls a write length", "high", "medium",
+            [
+                "Ghidra traces %s length argument %d at %s through %s"
+                % (_call_name(call), index, call.get("from"), ", ".join(operations))
+                for call, index, operations in width_changed_lengths
+            ],
+            "Test boundary values -1, 0, the destination size, and the source type maximum. A negative value converted to size_t or a truncated large value can produce an oversized write; build a payload only after the debugger confirms that conversion.",
+            ["Recover source and destination integer types.", "Compare the validated value with the value passed to the write call."],
+            "Validate in the unsigned destination type before conversion, reject negatives, and use checked conversion helpers.",
+        ))
+
+    double_free, use_after_free = _heap_lifetime_candidates(ghidra_calls)
+    if double_free:
+        findings.append(_finding(
+            "PWN-HEAP-001", "Repeated free of the same recovered pointer", "high", "medium", double_free,
+            "Reach both reported frees on one execution path. If confirmed, use allocator diagnostics to test duplicate-bin insertion; derive a write target only for the challenge allocator and version.",
+            ["Confirm both frees execute without an intervening reassignment.", "Record allocator family and hardening before selecting a heap technique."],
+            "Give each allocation one owner and clear or transfer the pointer after free.",
+        ))
+    if use_after_free:
+        findings.append(_finding(
+            "PWN-HEAP-002", "Freed pointer reused by a memory operation", "high", "medium", use_after_free,
+            "Reach the free and later dereference on one path, reclaim the same size class with controlled data, then test whether the reported operation reads or overwrites the replacement object.",
+            ["Confirm no reassignment dominates the later use.", "Use allocator tracing to prove the chunk was reclaimed."],
+            "Invalidate aliases after free and enforce object lifetime through single ownership.",
+        ))
+
+    stack_indirect = []
+    other_indirect = []
+    for call in ghidra_calls:
+        if call.get("indirect") is not True:
+            continue
+        target = call.get("target") if isinstance(call.get("target"), dict) else {}
+        entry = "indirect call at %s in %s; target %s" % (
+            call.get("from"), call.get("function") or "<unknown>",
+            _argument_identity(target) or target.get("repr") or "not recovered",
+        )
+        (stack_indirect if target.get("kind") == "stack" else other_indirect).append(entry)
+    if stack_indirect:
+        findings.append(_finding(
+            "PWN-CFLOW-001", "Stack-derived indirect call target", "high", "high", stack_indirect,
+            "Map writes to the reported stack slot. If challenge input controls the full function pointer, redirect it to a compatible fixed success routine or validated gadget.",
+            ["Confirm the target slot is writable from challenge input.", "Check the function signature and CFI policy before choosing a destination."],
+            "Keep control-flow targets outside writable input buffers and enable CFI or CFG.",
+        ))
+    elif other_indirect:
+        findings.append(_finding(
+            "PWN-CFLOW-001", "Indirect call requires target provenance review", "low", "low", other_indirect,
+            "Trace the recovered function pointer or vtable to its last write. Continue only if challenge input controls that write.",
+            ["Distinguish normal dispatch from a writable function pointer.", "Inspect all assignments reaching the call."],
+            "Protect dispatch tables from untrusted writes and enable CFI or CFG.",
         ))
 
     dangerous = sorted(imports & set(UNBOUNDED), key=str.lower)
@@ -250,6 +414,10 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         ))
 
     missing = [name for name in ("nx", "stack_canary", "pie" if info.format in {"ELF", "Mach-O"} else "aslr") if info.mitigations.get(name) is False]
+    if info.format == "ELF" and info.metadata.get("relro") in {"none", "partial"}:
+        missing.append("full_relro")
+    if info.format == "PE" and info.mitigations.get("cfg") is False:
+        missing.append("cfg")
     if missing:
         findings.append(_finding(
             "PWN-MIT-001", "Exploit mitigations disabled", "medium", "high",

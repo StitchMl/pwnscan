@@ -44,6 +44,7 @@ The current engine covers:
 - ELF gadgets, useful-string addresses, RWX sections, symbol addresses, PIE versus DSO, and RELRO state;
 - PE import tables, ASLR, DEP, CFG, and RWX sections;
 - unbounded writes, format-string targets, command sinks, ret2win paths, and mitigation gaps;
+- Ghidra-backed integer allocation arithmetic, write-length conversions, repeated frees, post-free memory use, and indirect call targets;
 - an exact ret2win payload when Ghidra proves the saved-return offset, input
   capacity, fixed target address, and absence of a stack canary.
 
@@ -68,8 +69,8 @@ review after triage; embedding the whole scanner in Ghidra would weaken CLI
 portability and complicate deterministic testing.
 
 [`ghidra_scripts/PwnscanExport.java`](ghidra_scripts/PwnscanExport.java) exports
-Ghidra symbols, functions, imports, call arguments, stack-buffer sizes, and
-P-code call references to deterministic JSON. The Python variant is retained
+Ghidra symbols, functions, imports, call arguments, bounded P-code expression
+trees, indirect targets, and stack-buffer sizes to deterministic JSON. The Python variant is retained
 for PyGhidra installations. Run either exporter after analysis, then merge it:
 
 ```console
@@ -87,7 +88,10 @@ Set `GHIDRA_HOME` instead of passing `--ghidra-home`. `--ghidra-timeout`
 limits analysis time. Ghidra reads and decompiles the target; it never runs it.
 Recovered P-code arguments let `pwnscan` prove constant-size stack overwrites,
 compute saved-return offsets, reject constant `printf("%s", value)` calls, and
-rank dynamic command arguments.
+rank dynamic command arguments. Expression trees also expose arithmetic and
+width conversions used by allocation and memory-write lengths. Pointer identity
+facts support lifetime review without claiming that two branch-separated calls
+execute on the same path.
 
 See
 [`docs/ghidra.md`](docs/ghidra.md).

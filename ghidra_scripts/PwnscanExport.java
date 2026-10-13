@@ -35,6 +35,29 @@ import java.util.Set;
 import java.util.TreeSet;
 
 public class PwnscanExport extends GhidraScript {
+    private Map<String, Object> expression(Varnode node, int depth, Set<String> seen) {
+        if (node == null || depth >= 5 || !seen.add(node.toString())) return null;
+        PcodeOp operation = node.getDef();
+        if (operation == null) return null;
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("op", operation.getMnemonic());
+        result.put("size", node.getSize());
+        List<Map<String, Object>> inputs = new ArrayList<>();
+        for (int index = 0; index < operation.getNumInputs(); index++) {
+            Varnode input = operation.getInput(index);
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("kind", input.isConstant() ? "constant" : "dynamic");
+            if (input.isConstant()) item.put("value", input.getOffset());
+            else item.put("repr", input.toString());
+            item.put("size", input.getSize());
+            Map<String, Object> nested = expression(input, depth + 1, new HashSet<>(seen));
+            if (nested != null) item.put("expression", nested);
+            inputs.add(item);
+        }
+        result.put("inputs", inputs);
+        return result;
+    }
+
     private Long stackOffset(Varnode node, Set<String> seen) {
         if (node == null || !seen.add(node.toString())) return null;
         Address address = node.getAddress();
@@ -113,6 +136,8 @@ public class PwnscanExport extends GhidraScript {
         } catch (RuntimeException ignored) {
             // High variables are optional decompiler metadata.
         }
+        Map<String, Object> expression = expression(node, 0, new HashSet<>());
+        if (expression != null) item.put("expression", expression);
         return item;
     }
 
@@ -154,6 +179,7 @@ public class PwnscanExport extends GhidraScript {
                 call.put("function", function.getName());
                 call.put("to", targetName(program, operation));
                 call.put("indirect", operation.getOpcode() == PcodeOp.CALLIND);
+                call.put("target", argument(program, function, operation.getInput(0)));
                 call.put("arguments", arguments);
                 result.add(call);
             }

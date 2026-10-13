@@ -25,8 +25,8 @@ The target is never executed. Use `--ghidra-timeout SECONDS` to bound analysis.
 The Java exporter works in standard headless and desktop Ghidra installations
 and emits sorted JSON. The Python variant requires PyGhidra. Neither modifies
 the program database. The CLI validates the schema and structure before using
-functions, imports, P-code call arguments, stack-buffer sizes, saved-return
-offsets, and call references.
+functions, imports, bounded P-code expression trees, indirect targets,
+stack-buffer sizes, saved-return offsets, and call references.
 
 Useful review order:
 

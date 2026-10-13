@@ -48,6 +48,31 @@ def _stack_offset(varnode, seen=None):
     return None
 
 
+def _expression(varnode, depth=0, seen=None):
+    if varnode is None or depth >= 5:
+        return None
+    if seen is None:
+        seen = set()
+    key = str(varnode)
+    if key in seen:
+        return None
+    seen.add(key)
+    operation = varnode.getDef()
+    if operation is None:
+        return None
+    inputs = []
+    for index in range(operation.getNumInputs()):
+        node = operation.getInput(index)
+        child = {"kind": "constant", "value": node.getOffset(), "size": node.getSize()} if node.isConstant() else {
+            "kind": "dynamic", "repr": str(node), "size": node.getSize()
+        }
+        nested = _expression(node, depth + 1, set(seen))
+        if nested is not None:
+            child["expression"] = nested
+        inputs.append(child)
+    return {"op": operation.getMnemonic(), "size": varnode.getSize(), "inputs": inputs}
+
+
 def _argument(program, function, varnode):
     item = {"kind": "dynamic", "repr": str(varnode), "size": varnode.getSize()}
     if varnode.isConstant():
@@ -79,6 +104,9 @@ def _argument(program, function, varnode):
             item["high_name"] = high.getName()
     except Exception:
         pass
+    expression = _expression(varnode)
+    if expression is not None:
+        item["expression"] = expression
     return item
 
 
@@ -113,7 +141,11 @@ def _decompiled_calls(program, monitor):
             if operation.getOpcode() not in (PcodeOp.CALL, PcodeOp.CALLIND):
                 continue
             arguments = [_argument(program, function, operation.getInput(index)) for index in range(1, operation.getNumInputs())]
-            result.append({"from": str(operation.getSeqnum().getTarget()), "function": function.getName(), "to": _target_name(program, operation), "indirect": operation.getOpcode() == PcodeOp.CALLIND, "arguments": arguments})
+            result.append({
+                "from": str(operation.getSeqnum().getTarget()), "function": function.getName(),
+                "to": _target_name(program, operation), "indirect": operation.getOpcode() == PcodeOp.CALLIND,
+                "target": _argument(program, function, operation.getInput(0)), "arguments": arguments,
+            })
     interface.dispose()
     return result
 
