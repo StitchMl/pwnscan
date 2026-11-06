@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Dict
 
 from .model import ScanReport
-
 
 COLORS = {"critical": "\033[1;31m", "high": "\033[31m", "medium": "\033[33m", "low": "\033[36m", "info": "\033[2m"}
 RESET = "\033[0m"

@@ -1,17 +1,18 @@
 import json
 
+from test_parsers import minimal_elf64
+
 from pwnscan.analyzer import analyze, scan_bytes
 from pwnscan.model import BinaryInfo
 from pwnscan.report import render_json, render_text
-from test_parsers import minimal_elf64
 
 
 def info(**updates):
-    values = dict(
-        format="ELF", bits=64, endian="little", architecture="x86_64",
-        entrypoint=0x401000, imports=[], symbols=[], strings=[],
-        mitigations={"nx": True, "pie": True, "stack_canary": True}, metadata={},
-    )
+    values = {
+        "format": "ELF", "bits": 64, "endian": "little", "architecture": "x86_64",
+        "entrypoint": 0x401000, "imports": [], "symbols": [], "strings": [],
+        "mitigations": {"nx": True, "pie": True, "stack_canary": True}, "metadata": {},
+    }
     values.update(updates)
     return BinaryInfo(**values)
 

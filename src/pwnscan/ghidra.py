@@ -49,9 +49,9 @@ def export_headless(target: Path, home: Optional[Path] = None, script: Optional[
     """Run Ghidra analysis in an isolated temporary project and return copied JSON."""
     executable = _headless_executable(home)
     export_script = _export_script(script)
-    output_handle = tempfile.NamedTemporaryFile(prefix="pwnscan-ghidra-", suffix=".json", delete=False)
-    output_handle.close()
-    output = Path(output_handle.name)
+    output_fd, output_name = tempfile.mkstemp(prefix="pwnscan-ghidra-", suffix=".json")
+    os.close(output_fd)
+    output = Path(output_name)
     with tempfile.TemporaryDirectory(prefix="pwnscan-ghidra-project-") as project:
         command = [
             str(executable), project, "pwnscan", "-import", str(target.resolve()),

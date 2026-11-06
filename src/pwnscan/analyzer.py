@@ -5,11 +5,10 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import List, Optional, Sequence
 
 from .model import BinaryInfo, Finding, ScanReport
 from .parsers import parse_binary
-
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s", "__isoc99_scanf": "may use an unbounded %s", "__isoc99_sscanf": "may use an unbounded %s", "__isoc99_fscanf": "may use an unbounded %s"}
@@ -480,7 +479,7 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     )
 
 
-def scan_file(path: Path, ghidra_export: Path = None) -> ScanReport:
+def scan_file(path: Path, ghidra_export: Optional[Path] = None) -> ScanReport:
     data = path.read_bytes()
     info = parse_binary(data)
     if ghidra_export is not None:

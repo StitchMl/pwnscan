@@ -1,7 +1,7 @@
-from pathlib import Path
+
+from test_parsers import minimal_elf64
 
 from pwnscan.cli import main
-from test_parsers import minimal_elf64
 
 
 def test_cli_json(tmp_path, capsys):

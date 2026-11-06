@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import re
 import struct
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .model import BinaryInfo
 
@@ -49,7 +48,7 @@ def _interesting_names(strings: Sequence[str]) -> List[str]:
     for value in strings:
         tail = value.rsplit("/", 1)[-1]
         for api in INTERESTING_APIS:
-            if tail == api or tail.startswith(api + "@") or tail.startswith("_" + api):
+            if tail == api or tail.startswith((api + "@", "_" + api)):
                 found.add(api)
     return sorted(found, key=str.lower)
 
