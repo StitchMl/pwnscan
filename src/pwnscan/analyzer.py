@@ -12,7 +12,7 @@ from .parsers import parse_binary
 
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s"}
+UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s", "__isoc99_scanf": "may use an unbounded %s", "__isoc99_sscanf": "may use an unbounded %s", "__isoc99_fscanf": "may use an unbounded %s"}
 FORMAT_SINKS = {"printf", "fprintf", "syslog"}
 COMMAND_SINKS = {"system", "popen", "execve", "WinExec", "CreateProcess"}
 BOUNDED_WRITES = {

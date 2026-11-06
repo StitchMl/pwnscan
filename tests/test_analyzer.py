@@ -26,6 +26,16 @@ def test_overflow_vector_uses_mitigations():
     assert "ROP/ret2libc" in overflow.attack_vector
 
 
+def test_glibc_isoc99_scanf_import_is_an_unbounded_surface():
+    findings = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401050", "function": "main", "to": "__isoc99_scanf"}]}},
+    ))
+    overflow = next(item for item in findings if item.id == "PWN-BOF-001")
+    assert any("__isoc99_scanf" in reason for reason in overflow.evidence)
+
+
 def test_format_string_requires_sink_and_clue():
     findings = analyze(info(imports=["printf"], strings=["hello %7$p", "%n"], metadata={"parsed_imports": ["printf"]}))
     assert any(item.id == "PWN-FMT-001" for item in findings)
