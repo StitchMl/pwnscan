@@ -443,7 +443,7 @@ def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
 
 def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     try:
-        payload = json.loads(export_path.read_text(encoding="utf-8"))
+        payload = json.loads(export_path.read_text(encoding="utf-8"))  # NOSONAR: reads the user-supplied Ghidra export path (CLI tool)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid Ghidra export: %s" % exc) from exc
     if payload.get("schema") != "pwnscan-ghidra/v1":
@@ -480,7 +480,7 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
 
 
 def scan_file(path: Path, ghidra_export: Optional[Path] = None) -> ScanReport:
-    data = path.read_bytes()
+    data = path.read_bytes()  # NOSONAR: reads the user-supplied target binary (CLI tool)
     info = parse_binary(data)
     if ghidra_export is not None:
         info = _merge_ghidra(info, ghidra_export)
