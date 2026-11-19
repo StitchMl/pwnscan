@@ -32,19 +32,23 @@ patch. JSON output uses the stable
 ```console
 pwnscan ./challenge --color always
 pwnscan ./challenge --format json --pretty
+pwnscan ./challenge --min-severity medium --output report.txt
 pwnscan ./challenge --fail-on high
 ```
 
-`--fail-on` returns exit code `3` when the report contains the selected
-severity or a higher one. Parse and input errors return `2`.
+`--min-severity` filters the reported findings to the selected severity or higher
+(and `--fail-on` evaluates the filtered findings). `--output` (`-o`) writes the
+report to a file without ANSI color sequences in `auto` mode. `--fail-on`
+returns exit code `3` when the report contains the selected severity or a higher
+one. Parse and input errors return `2`.
 
 The current engine covers:
 
-- parsed imports, undefined ELF symbols, exported functions, and string hints as separate evidence classes;
-- ELF gadgets, useful-string addresses, RWX sections, symbol addresses, PIE versus DSO, and RELRO state;
-- PE import tables, ASLR, DEP, CFG, and RWX sections;
+- parsed imports, undefined ELF/Mach-O symbols, exported functions (ELF, PE, Mach-O), and string hints as separate evidence classes;
+- ELF gadgets, useful-string addresses, RWX sections, symbol addresses, PIE (including static-PIE via `DF_1_PIE`) versus DSO, and RELRO state;
+- PE import/export tables, ASLR, DEP, CFG, and RWX sections;
 - unbounded writes, format-string targets, command sinks, ret2win paths, and mitigation gaps;
-- Ghidra-backed integer allocation arithmetic, write-length conversions, repeated frees, post-free memory use, and indirect call targets;
+- Ghidra-backed constant-length stack overwrites, integer allocation arithmetic, write-length sign/truncation conversions, repeated frees, post-free memory use, and indirect call targets;
 - an exact ret2win payload when Ghidra proves the saved-return offset, input
   capacity, fixed target address, and absence of a stack canary.
 
@@ -95,6 +99,13 @@ execute on the same path.
 
 See
 [`docs/ghidra.md`](docs/ghidra.md).
+
+## Known limitations
+
+- **Intraprocedural heap lifetime (`PWN-HEAP-001`, `PWN-HEAP-002`)**: calls within a function are ordered by address without full CFG/dominance or pointer-reassignment tracking, so mutually exclusive branches can trigger false positives.
+- **Expression-tree integer checks (`PWN-INT-001`, `PWN-SIGN-001`)**: P-code expression trees identify arithmetic or width/sign conversions with dynamic operands, without proving the absence of prior bounds checks.
+- **Byte-level gadget scan (`PWN-ROP-001`)**: ELF gadgets are matched as raw byte sequences in executable sections and should be verified against instruction boundaries in a disassembler.
+- **Thin Mach-O only**: universal/fat Mach-O containers are rejected; extract a single architecture slice first.
 
 ## Tests
 

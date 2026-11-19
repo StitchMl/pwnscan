@@ -54,3 +54,48 @@ def test_headless_failure_reports_tail_and_removes_output(tmp_path, monkeypatch)
     )
     with pytest.raises(GhidraError, match="fatal analysis error"):
         export_headless(target, home, script, 17)
+
+
+def test_headless_executable_discovery_and_errors(tmp_path, monkeypatch):
+    from pwnscan.ghidra import _export_script, _headless_executable
+
+    monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: None)
+    monkeypatch.delenv("GHIDRA_HOME", raising=False)
+    with pytest.raises(GhidraError, match="Ghidra headless not found"):
+        _headless_executable(None)
+
+    home = tmp_path / "ghidra"
+    support = home / "support"
+    support.mkdir(parents=True)
+    executable = support / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GHIDRA_HOME", str(home))
+    assert _headless_executable(None) == executable
+
+    located = str(tmp_path / "on-path-headless")
+    monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: located)
+    assert _headless_executable(None) == Path(located)
+
+    monkeypatch.setattr("pwnscan.ghidra.Path.is_file", lambda _self: False)
+    with pytest.raises(GhidraError, match=r"PwnscanExport\.java not found"):
+        _export_script(tmp_path / "missing.java")
+
+
+def test_headless_timeout_raises_ghidra_error(tmp_path, monkeypatch):
+    import subprocess
+
+    home = tmp_path / "ghidra"
+    support = home / "support"
+    support.mkdir(parents=True)
+    (support / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")).write_text("", encoding="utf-8")
+    script = tmp_path / "PwnscanExport.java"
+    script.write_text("", encoding="utf-8")
+    target = tmp_path / "challenge"
+    target.write_bytes(b"\x7fELF")
+
+    def fake_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="analyzeHeadless", timeout=5)
+
+    monkeypatch.setattr("pwnscan.ghidra.subprocess.run", fake_timeout)
+    with pytest.raises(GhidraError, match="Ghidra headless failed"):
+        export_headless(target, home, script, 5)

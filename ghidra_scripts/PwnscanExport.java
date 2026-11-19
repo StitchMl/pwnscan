@@ -72,7 +72,10 @@ public class PwnscanExport extends GhidraScript {
             Varnode base = operation.getInput(0);
             Varnode offset = operation.getInput(1);
             Address baseAddress = base == null ? null : base.getAddress();
-            if (offset != null && offset.isConstant() && baseAddress != null && baseAddress.isStackAddress()) {
+            String baseRepr = base == null ? "" : base.toString().toUpperCase();
+            boolean stackBase = (baseAddress != null && baseAddress.isStackAddress())
+                || baseRepr.contains("RSP") || baseRepr.contains("ESP");
+            if (offset != null && offset.isConstant() && stackBase) {
                 long value = offset.getOffset();
                 int bits = offset.getSize() * 8;
                 if (bits > 0 && bits < 64 && (value & (1L << (bits - 1))) != 0) value -= 1L << bits;
@@ -159,32 +162,35 @@ public class PwnscanExport extends GhidraScript {
     private List<Map<String, Object>> calls(Program program) {
         List<Map<String, Object>> result = new ArrayList<>();
         DecompInterface decompiler = new DecompInterface();
-        decompiler.openProgram(program);
-        FunctionIterator functions = program.getFunctionManager().getFunctions(true);
-        while (functions.hasNext() && !monitor.isCancelled()) {
-            Function function = functions.next();
-            DecompileResults completed = decompiler.decompileFunction(function, 30, monitor);
-            HighFunction high = completed != null && completed.decompileCompleted() ? completed.getHighFunction() : null;
-            if (high == null) continue;
-            Iterator<PcodeOpAST> operations = high.getPcodeOps();
-            while (operations.hasNext()) {
-                PcodeOpAST operation = operations.next();
-                if (operation.getOpcode() != PcodeOp.CALL && operation.getOpcode() != PcodeOp.CALLIND) continue;
-                List<Map<String, Object>> arguments = new ArrayList<>();
-                for (int index = 1; index < operation.getNumInputs(); index++) {
-                    arguments.add(argument(program, function, operation.getInput(index)));
+        try {
+            decompiler.openProgram(program);
+            FunctionIterator functions = program.getFunctionManager().getFunctions(true);
+            while (functions.hasNext() && !monitor.isCancelled()) {
+                Function function = functions.next();
+                DecompileResults completed = decompiler.decompileFunction(function, 30, monitor);
+                HighFunction high = completed != null && completed.decompileCompleted() ? completed.getHighFunction() : null;
+                if (high == null) continue;
+                Iterator<PcodeOpAST> operations = high.getPcodeOps();
+                while (operations.hasNext()) {
+                    PcodeOpAST operation = operations.next();
+                    if (operation.getOpcode() != PcodeOp.CALL && operation.getOpcode() != PcodeOp.CALLIND) continue;
+                    List<Map<String, Object>> arguments = new ArrayList<>();
+                    for (int index = 1; index < operation.getNumInputs(); index++) {
+                        arguments.add(argument(program, function, operation.getInput(index)));
+                    }
+                    Map<String, Object> call = new LinkedHashMap<>();
+                    call.put("from", operation.getSeqnum().getTarget().toString());
+                    call.put("function", function.getName());
+                    call.put("to", targetName(program, operation));
+                    call.put("indirect", operation.getOpcode() == PcodeOp.CALLIND);
+                    call.put("target", argument(program, function, operation.getInput(0)));
+                    call.put("arguments", arguments);
+                    result.add(call);
                 }
-                Map<String, Object> call = new LinkedHashMap<>();
-                call.put("from", operation.getSeqnum().getTarget().toString());
-                call.put("function", function.getName());
-                call.put("to", targetName(program, operation));
-                call.put("indirect", operation.getOpcode() == PcodeOp.CALLIND);
-                call.put("target", argument(program, function, operation.getInput(0)));
-                call.put("arguments", arguments);
-                result.add(call);
             }
+        } finally {
+            decompiler.dispose();
         }
-        decompiler.dispose();
         result.sort(Comparator.comparing(item -> String.valueOf(item.get("to")) + "\0" + item.get("function") + "\0" + item.get("from")));
         return result;
     }

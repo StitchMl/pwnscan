@@ -68,3 +68,31 @@ def test_cli_rejects_two_ghidra_sources(tmp_path, capsys):
 def test_cli_rejects_non_file(tmp_path, capsys):
     assert main([str(tmp_path / "missing")]) == 2
     assert "target is not a file" in capsys.readouterr().err
+
+
+def test_cli_text_output_and_min_severity(tmp_path, capsys):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64(b"gets\0"))
+    assert main([str(target), "--color", "never"]) == 0
+    out = capsys.readouterr().out
+    assert "PWN-MIT-001" in out
+    assert "PWN-BOF-001" in out
+
+    assert main([str(target), "--format", "json", "--min-severity", "medium"]) == 0
+    filtered = capsys.readouterr().out
+    assert "PWN-MIT-001" in filtered
+    assert "PWN-BOF-001" not in filtered
+
+
+def test_cli_output_file_and_invalid_timeout(tmp_path, capsys):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64(b"gets\0"))
+    report_path = tmp_path / "report.txt"
+    assert main([str(target), "--output", str(report_path)]) == 0
+    assert capsys.readouterr().out == ""
+    content = report_path.read_text(encoding="utf-8")
+    assert "pwnscan ELF 64-bit x86_64" in content
+    assert "\x1b[" not in content
+
+    assert main([str(target), "--ghidra-timeout", "0"]) == 2
+    assert "--ghidra-timeout must be positive" in capsys.readouterr().err
