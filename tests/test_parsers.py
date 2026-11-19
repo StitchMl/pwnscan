@@ -287,3 +287,24 @@ def test_elf_plt_addresses_resolves_plt_sec_stubs():
 
     info = parse_binary(bytes(data))
     assert info.metadata["plt_addresses"] == {"0x401120": "printf"}
+
+
+def test_elf_fortify_source_detection():
+    assert parse_binary(structured_elf64()).mitigations["fortify"] is False
+
+    data = bytearray(0x340)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 2, 62, 1, 0x401000, 0, 0x200, 0, 64, 0, 0, 64, 4, 3)
+    data[0x100:0x11d] = b"\0__printf_chk\0__memcpy_chk\0"
+    struct.pack_into("<IBBHQQ", data, 0x158, 1, 0x12, 0, 0, 0, 0)
+    struct.pack_into("<IBBHQQ", data, 0x170, 14, 0x12, 0, 0, 0, 0)
+    names = b"\0.dynstr\0.dynsym\0.shstrtab\0"
+    data[0x190:0x190 + len(names)] = names
+    struct.pack_into("<IIQQQQIIQQ", data, 0x240, 1, 3, 2, 0, 0x100, 29, 0, 0, 1, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x280, 9, 11, 2, 0, 0x140, 72, 1, 1, 8, 24)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x2C0, 17, 3, 0, 0, 0x190, len(names), 0, 0, 1, 0)
+    info = parse_binary(bytes(data))
+    assert info.mitigations["fortify"] is True
+    assert info.metadata["fortified_imports"] == ["__memcpy_chk", "__printf_chk"]

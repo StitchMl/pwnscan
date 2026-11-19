@@ -403,3 +403,24 @@ def test_ghidra_pie_image_base_and_dat_symbol_resolve_plt_and_strip_versions(tmp
     uaf = next(item for item in analyze(merged) if item.id == "PWN-HEAP-002")
     assert "puts" in uaf.evidence[0]
     assert "00101731" in uaf.evidence[0]
+
+
+def test_fortify_source_disabled_and_chk_format_argument():
+    mit = next(item for item in analyze(info(mitigations={"nx": True, "pie": True, "stack_canary": True, "fortify": False})) if item.id == "PWN-MIT-001")
+    assert "fortify_source disabled" in mit.evidence
+
+    dyn_chk = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "__printf_chk", "arguments": [
+            {"kind": "constant", "value": 1},
+            {"kind": "stack", "stack_offset": -32},
+        ]},
+    ]}}))
+    assert any(item.id == "PWN-FMT-001" for item in dyn_chk)
+
+    const_chk = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "__printf_chk", "arguments": [
+            {"kind": "constant", "value": 1},
+            {"kind": "address_constant", "address": "00402000", "writable": False},
+        ]},
+    ]}}))
+    assert not any(item.id == "PWN-FMT-001" for item in const_chk)

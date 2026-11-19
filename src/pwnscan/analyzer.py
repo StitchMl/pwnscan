@@ -17,12 +17,17 @@ FORMAT_INDEXES = {
     "printf": 0, "vprintf": 0,
     "fprintf": 1, "dprintf": 1, "sprintf": 1, "vfprintf": 1, "vsprintf": 1, "syslog": 1,
     "snprintf": 2, "vsnprintf": 2,
+    "printf_chk": 1, "vprintf_chk": 1,
+    "fprintf_chk": 2, "dprintf_chk": 2, "vfprintf_chk": 2,
+    "sprintf_chk": 3, "vsprintf_chk": 3,
+    "snprintf_chk": 4, "vsnprintf_chk": 4,
 }
 COMMAND_SINKS = {"system", "popen", "execve", "WinExec", "CreateProcess"}
 BOUNDED_WRITES = {
     "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2),
     "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2), "strncat": (0, 2),
     "fgets": (0, 1), "snprintf": (0, 1),
+    "read_chk": (1, 2), "recv_chk": (1, 2), "memcpy_chk": (0, 2), "memmove_chk": (0, 2), "fgets_chk": (0, 2),
 }
 DEALLOCATORS = {"free", "operator delete", "delete"}
 HEAP_DEREFERENCE_ARGUMENTS = {
@@ -452,6 +457,8 @@ def _check_mitigations(info: BinaryInfo) -> Optional[Finding]:
     missing = [name for name in ("nx", "stack_canary", "pie" if info.format in {"ELF", "Mach-O"} else "aslr") if info.mitigations.get(name) is False]
     if info.format == "ELF" and info.metadata.get("relro") in {"none", "partial"}:
         missing.append("full_relro")
+    if info.format == "ELF" and info.mitigations.get("fortify") is False:
+        missing.append("fortify_source")
     if info.format == "PE" and info.mitigations.get("cfg") is False:
         missing.append("cfg")
     if not missing:

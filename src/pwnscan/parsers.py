@@ -32,6 +32,20 @@ INTERESTING_APIS = (
     "CreateProcess", "LoadLibrary", "GetProcAddress",
     "malloc", "calloc", "realloc", "free", "operator new", "operator delete",
 )
+FORTIFY_APIS = frozenset({
+    "__memcpy_chk", "__memmove_chk", "__memset_chk", "__strcpy_chk",
+    "__stpcpy_chk", "__strncpy_chk", "__strcat_chk", "__strncat_chk",
+    "__sprintf_chk", "__vsprintf_chk", "__snprintf_chk", "__vsnprintf_chk",
+    "__printf_chk", "__fprintf_chk", "__dprintf_chk", "__vprintf_chk",
+    "__vfprintf_chk", "__fgets_chk", "__gets_chk", "__read_chk",
+    "__recv_chk", "__recvfrom_chk",
+})
+FORTIFIABLE_APIS = frozenset({
+    "memcpy", "memmove", "memset", "strcpy", "stpcpy", "strncpy",
+    "strcat", "strncat", "sprintf", "vsprintf", "snprintf", "vsnprintf",
+    "printf", "fprintf", "dprintf", "vprintf", "vfprintf", "fgets",
+    "gets", "read", "recv", "recvfrom",
+})
 
 
 def extract_strings(data: bytes, minimum: int = 4, limit: int = 4000) -> List[str]:
@@ -168,12 +182,19 @@ def parse_elf(data: bytes) -> BinaryInfo:
     symbols, symbol_addresses, undefined_symbols, has_symtab = _elf_symbols(data, bits, endian_char, sections)
     values = extract_strings(data)
     parsed_imports = sorted({name for name in undefined_symbols if name in INTERESTING_APIS}, key=str.lower)
+    fortified_imports = sorted({name for name in undefined_symbols if name in FORTIFY_APIS}, key=str.lower)
     string_hints = sorted(set(_interesting_names(values)) - set(parsed_imports), key=str.lower)
     imports = sorted(set(parsed_imports) | set(string_hints), key=str.lower)
     stack_canary = (
         any(name in {"__stack_chk_fail", "__stack_chk_guard"} or name.startswith("__stack_chk_fail@") for name in symbols)
         or (not has_symtab and b"__stack_chk_fail" in data)
     )
+    if fortified_imports:
+        fortify: Optional[bool] = True
+    elif has_symtab and any(name in FORTIFIABLE_APIS for name in undefined_symbols):
+        fortify = False
+    else:
+        fortify = None
     pie = e_type == 3 and (has_interp or is_pie_flag)
     relro_state = "full" if relro and bind_now else ("partial" if relro else "none")
     architecture = ELF_MACHINES.get(machine, "machine-%d" % machine)
@@ -182,11 +203,11 @@ def parse_elf(data: bytes) -> BinaryInfo:
         format="ELF", bits=bits, endian=endian,
         architecture=architecture,
         entrypoint=entry, imports=imports, symbols=symbols, strings=values,
-        mitigations={"nx": nx, "pie": pie, "stack_canary": stack_canary, "relro": relro, "aslr": e_type == 3},
+        mitigations={"nx": nx, "pie": pie, "stack_canary": stack_canary, "relro": relro, "aslr": e_type == 3, "fortify": fortify},
         metadata={
             "elf_type": e_type, "elf_role": "pie" if pie else ("shared_object" if e_type == 3 else "executable"),
             "dynamic": dynamic, "relro": relro_state, "sections": sorted({section.name for section in sections}),
-            "parsed_imports": parsed_imports, "string_import_hints": string_hints,
+            "parsed_imports": parsed_imports, "fortified_imports": fortified_imports, "string_import_hints": string_hints,
             "symbol_addresses": symbol_addresses,
             "plt_addresses": plt_addresses,
             **_elf_exploit_metadata(data, bits, sections, architecture),
