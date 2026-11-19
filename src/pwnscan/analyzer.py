@@ -527,6 +527,25 @@ def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
     return ScanReport("pwnscan/v1", target, hashlib.sha256(data).hexdigest(), len(data), info, analyze(info))
 
 
+def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict) -> List[dict]:
+    resolved: List[dict] = []
+    for item in calls:
+        if not isinstance(item, dict):
+            continue
+        call = dict(item)
+        if not call.get("to") and plt_addresses:
+            target = call.get("target")
+            repr_text = target.get("repr") if isinstance(target, dict) else None
+            if isinstance(repr_text, str):
+                match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
+                if match:
+                    addr_key = "0x%x" % int(match.group(1), 16)
+                    if addr_key in plt_addresses:
+                        call["to"] = plt_addresses[addr_key]
+        resolved.append(call)
+    return sorted(resolved, key=lambda item: (str(item.get("to", "")), str(item.get("from", ""))))
+
+
 def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     try:
         payload = json.loads(export_path.read_text(encoding="utf-8"))  # NOSONAR: reads the user-supplied Ghidra export path (CLI tool)
@@ -551,10 +570,11 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
         except ValueError:
             continue
     metadata["symbol_addresses"] = {name: addresses[name] for name in sorted(addresses, key=str.lower)}
+    plt_addresses = metadata.get("plt_addresses", {})
     metadata["ghidra"] = {
         "language": payload.get("language"),
         "image_base": payload.get("image_base"),
-        "calls": sorted((item for item in calls if isinstance(item, dict)), key=lambda item: (str(item.get("to", "")), str(item.get("from", "")))),
+        "calls": _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}),
     }
     metadata["parsed_imports"] = sorted(set(metadata.get("parsed_imports", [])) | clean_imports, key=str.lower)
     return replace(

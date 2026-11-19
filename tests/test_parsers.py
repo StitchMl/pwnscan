@@ -263,3 +263,27 @@ def test_macho_symtab_unixstack_initprot_and_fat_rejection():
     fat = struct.pack(">II", 0xCAFEBABE, 2) + b"\0" * 40
     with pytest.raises(ParseError, match="thin slice"):
         parse_binary(fat)
+
+
+def test_elf_plt_addresses_resolves_plt_sec_stubs():
+    # Sections: 0=null, 1=.dynstr, 2=.dynsym, 3=.rela.plt, 4=.plt.sec, 5=.shstrtab
+    data = bytearray(0x400)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 2, 62, 1, 0x401000, 0, 0x200, 0, 64, 0, 0, 64, 6, 5)
+    data[0x100:0x109] = b"\0printf\0"
+    # .dynsym: entry 0 (null), entry 1 (printf)
+    struct.pack_into("<IBBHQQ", data, 0x138, 1, 0x12, 0, 0, 0, 0)
+    # .rela.plt: entry 0 -> sym_index=1 (r_info = 1 << 32 | 7)
+    struct.pack_into("<QQq", data, 0x160, 0x404018, (1 << 32) | 7, 0)
+    names = b"\0.dynstr\0.dynsym\0.rela.plt\0.plt.sec\0.shstrtab\0"
+    data[0x190:0x190 + len(names)] = names
+    struct.pack_into("<IIQQQQIIQQ", data, 0x240, 1, 3, 2, 0, 0x100, 9, 0, 0, 1, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x280, 9, 11, 2, 0, 0x120, 48, 1, 1, 8, 24)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x2C0, 17, 4, 2, 0, 0x160, 24, 2, 0, 8, 24)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x300, 27, 1, 6, 0x401120, 0x180, 16, 0, 0, 16, 16)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x340, 36, 3, 0, 0, 0x190, len(names), 0, 0, 1, 0)
+
+    info = parse_binary(bytes(data))
+    assert info.metadata["plt_addresses"] == {"0x401120": "printf"}

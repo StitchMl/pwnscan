@@ -177,6 +177,7 @@ def parse_elf(data: bytes) -> BinaryInfo:
     pie = e_type == 3 and (has_interp or is_pie_flag)
     relro_state = "full" if relro and bind_now else ("partial" if relro else "none")
     architecture = ELF_MACHINES.get(machine, "machine-%d" % machine)
+    plt_addresses = _elf_plt_addresses(data, bits, endian_char, sections, architecture)
     return BinaryInfo(
         format="ELF", bits=bits, endian=endian,
         architecture=architecture,
@@ -187,6 +188,7 @@ def parse_elf(data: bytes) -> BinaryInfo:
             "dynamic": dynamic, "relro": relro_state, "sections": sorted({section.name for section in sections}),
             "parsed_imports": parsed_imports, "string_import_hints": string_hints,
             "symbol_addresses": symbol_addresses,
+            "plt_addresses": plt_addresses,
             **_elf_exploit_metadata(data, bits, sections, architecture),
         },
     )
@@ -265,6 +267,52 @@ def _elf_symbols(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSec
         sorted(undefined, key=str.lower),
         has_symtab,
     )
+
+
+def _elf_plt_addresses(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSection], architecture: str) -> Dict[str, str]:
+    if architecture not in {"x86", "x86_64"}:
+        return {}
+    by_name = {section.name: section for section in sections}
+    rel_section = by_name.get(".rela.plt") or by_name.get(".rel.plt")
+    if rel_section is None or rel_section.kind not in {4, 9} or rel_section.link >= len(sections):
+        return {}
+    dynsym = sections[rel_section.link]
+    if dynsym.kind not in {2, 11} or dynsym.link >= len(sections):
+        return {}
+    dynstr = sections[dynsym.link]
+    if dynstr.kind == 8:
+        return {}
+    plt_sec = by_name.get(".plt.sec")
+    plt_base = plt_sec or by_name.get(".plt")
+    if plt_base is None or plt_base.va == 0:
+        return {}
+    plt_stride = plt_base.item_size or 16
+    first_index = 0 if plt_sec is not None else 1
+    is_rela = rel_section.kind == 4
+    rel_stride = rel_section.item_size or ((24 if is_rela else 16) if bits == 64 else (12 if is_rela else 8))
+    sym_stride = dynsym.item_size or (24 if bits == 64 else 16)
+    if rel_stride < (16 if bits == 64 else 8) or sym_stride < (24 if bits == 64 else 16):
+        return {}
+    strings = data[dynstr.offset:min(len(data), dynstr.offset + dynstr.size)]
+    count = min(rel_section.size // rel_stride, 65535)
+    result: Dict[str, str] = {}
+    for index in range(count):
+        rel_at = rel_section.offset + index * rel_stride
+        if rel_at + rel_stride > len(data):
+            break
+        r_info = _u(data, rel_at + (8 if bits == 64 else 4), "Q" if bits == 64 else "I", endian)
+        sym_index = (r_info >> 32) if bits == 64 else (r_info >> 8)
+        sym_at = dynsym.offset + sym_index * sym_stride
+        if sym_at + 4 > min(len(data), dynsym.offset + dynsym.size):
+            continue
+        name = _c_string(strings, _u(data, sym_at, "I", endian))
+        if not name:
+            continue
+        stub_va = plt_base.va + (index + first_index) * plt_stride
+        if plt_base.size and stub_va >= plt_base.va + plt_base.size:
+            break
+        result["0x%x" % stub_va] = name
+    return result
 
 
 def _elf_exploit_metadata(data: bytes, bits: int, sections: Sequence[_ElfSection], architecture: str) -> Dict[str, object]:

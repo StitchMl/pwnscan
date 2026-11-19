@@ -344,3 +344,27 @@ def test_underscore_prefixed_ghidra_callsite_and_import_normalization(tmp_path):
     assert bof.severity == "high"
     assert bof.confidence == "high"
     assert any("Ghidra reference:" in item for item in bof.evidence)
+
+
+def test_ghidra_call_without_to_resolves_from_elf_plt_addresses(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "functions": [{"name": "func", "entry": "00401387"}],
+        "imports": ["<EXTERNAL>::printf"],
+        "calls": [{
+            "from": "00401491",
+            "function": "func",
+            "to": None,
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x401170, 8)", "size": 8},
+            "arguments": [{"kind": "stack", "stack_offset": -1048}],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x401170": "printf"}}), export)
+    fmt = next(item for item in analyze(merged) if item.id == "PWN-FMT-001")
+    assert fmt.severity == "high"
+    assert fmt.confidence == "high"
+    assert "00401491 in func -> printf" in fmt.evidence[0]

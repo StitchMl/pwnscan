@@ -7,6 +7,7 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Program;
@@ -16,6 +17,8 @@ import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.PcodeOpAST;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.symbol.ExternalReference;
+import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 
@@ -58,7 +61,7 @@ public class PwnscanExport extends GhidraScript {
         return result;
     }
 
-    private Long stackOffset(Varnode node, Set<String> seen) {
+    private Long stackOffset(Program program, Varnode node, Set<String> seen) {
         if (node == null || !seen.add(node.toString())) return null;
         Address address = node.getAddress();
         if (address != null && address.isStackAddress()) return address.getOffset();
@@ -66,30 +69,50 @@ public class PwnscanExport extends GhidraScript {
         if (operation == null) return null;
         int opcode = operation.getOpcode();
         if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST || opcode == PcodeOp.INDIRECT) {
-            return stackOffset(operation.getInput(0), seen);
+            return stackOffset(program, operation.getInput(0), seen);
         }
         if (opcode == PcodeOp.PTRSUB || opcode == PcodeOp.PTRADD) {
             Varnode base = operation.getInput(0);
             Varnode offset = operation.getInput(1);
             Address baseAddress = base == null ? null : base.getAddress();
-            String baseRepr = base == null ? "" : base.toString().toUpperCase();
+            Register baseReg = base == null ? null : program.getRegister(base);
+            Register stackReg = program.getCompilerSpec().getStackPointer();
             boolean stackBase = (baseAddress != null && baseAddress.isStackAddress())
-                || baseRepr.contains("RSP") || baseRepr.contains("ESP");
+                || (baseReg != null && stackReg != null && baseReg.equals(stackReg));
             if (offset != null && offset.isConstant() && stackBase) {
                 long value = offset.getOffset();
                 int bits = offset.getSize() * 8;
                 if (bits > 0 && bits < 64 && (value & (1L << (bits - 1))) != 0) value -= 1L << bits;
                 return value;
             }
-            return stackOffset(base, seen);
+            return stackOffset(program, base, seen);
         }
         if (opcode == PcodeOp.MULTIEQUAL) {
             Set<Long> values = new HashSet<>();
             for (int index = 0; index < operation.getNumInputs(); index++) {
-                Long value = stackOffset(operation.getInput(index), new HashSet<>(seen));
+                Long value = stackOffset(program, operation.getInput(index), new HashSet<>(seen));
                 if (value != null) values.add(value);
             }
             return values.size() == 1 ? values.iterator().next() : null;
+        }
+        return null;
+    }
+
+    private Long constantAddressValue(Varnode node, Set<String> seen) {
+        if (node == null || !seen.add(node.toString())) return null;
+        if (node.isConstant()) return node.getOffset();
+        PcodeOp operation = node.getDef();
+        if (operation == null) return null;
+        int opcode = operation.getOpcode();
+        if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST) {
+            return constantAddressValue(operation.getInput(0), seen);
+        }
+        if (opcode == PcodeOp.PTRSUB && operation.getNumInputs() >= 2) {
+            Varnode base = operation.getInput(0);
+            Varnode offset = operation.getInput(1);
+            if (base != null && base.isConstant() && base.getOffset() == 0 && offset != null && offset.isConstant()) {
+                return offset.getOffset();
+            }
         }
         return null;
     }
@@ -99,8 +122,9 @@ public class PwnscanExport extends GhidraScript {
         item.put("kind", "dynamic");
         item.put("repr", node.toString());
         item.put("size", node.getSize());
-        if (node.isConstant()) {
-            long value = node.getOffset();
+        Long constValue = constantAddressValue(node, new HashSet<>());
+        if (constValue != null) {
+            long value = constValue;
             item.put("kind", "constant");
             item.put("value", value);
             try {
@@ -117,7 +141,7 @@ public class PwnscanExport extends GhidraScript {
                 // Preserve the numeric constant when it is not a valid address.
             }
         }
-        Long offset = stackOffset(node, new HashSet<>());
+        Long offset = stackOffset(program, node, new HashSet<>());
         if (offset != null) {
             item.put("kind", "stack");
             item.put("stack_offset", offset);
@@ -144,19 +168,39 @@ public class PwnscanExport extends GhidraScript {
         return item;
     }
 
+    private String resolveAddressName(Program program, Address address) {
+        if (address == null) return null;
+        Function function = program.getFunctionManager().getFunctionAt(address);
+        if (function == null) function = program.getFunctionManager().getFunctionContaining(address);
+        if (function != null) return function.getName();
+        Symbol symbol = program.getSymbolTable().getPrimarySymbol(address);
+        return symbol == null ? null : symbol.getName();
+    }
+
     private String targetName(Program program, PcodeOpAST operation) {
         Varnode target = operation.getInput(0);
-        if (target == null) return null;
-        Address address = target.getAddress();
-        if (target.isConstant()) {
-            try {
-                address = program.getAddressFactory().getDefaultAddressSpace().getAddress(target.getOffset());
-            } catch (RuntimeException ignored) {
-                return null;
+        if (target != null) {
+            Address address = target.getAddress();
+            if (target.isConstant()) {
+                try {
+                    address = program.getAddressFactory().getDefaultAddressSpace().getAddress(target.getOffset());
+                } catch (RuntimeException ignored) {
+                    address = null;
+                }
             }
+            String resolved = resolveAddressName(program, address);
+            if (resolved != null) return resolved;
         }
-        Function function = program.getFunctionManager().getFunctionAt(address);
-        return function == null ? null : function.getName();
+        Address callSite = operation.getSeqnum().getTarget();
+        for (Reference ref : program.getReferenceManager().getReferencesFrom(callSite)) {
+            if (!ref.getReferenceType().isCall()) continue;
+            if (ref instanceof ExternalReference) {
+                return ((ExternalReference) ref).getExternalLocation().getLabel();
+            }
+            String resolved = resolveAddressName(program, ref.getToAddress());
+            if (resolved != null) return resolved;
+        }
+        return null;
     }
 
     private List<Map<String, Object>> calls(Program program) {
@@ -197,6 +241,10 @@ public class PwnscanExport extends GhidraScript {
 
     @Override
     protected void run() throws Exception {
+        if (currentProgram == null) {
+            printerr("No program open in CodeBrowser.");
+            return;
+        }
         List<Map<String, Object>> functions = new ArrayList<>();
         FunctionIterator iterator = currentProgram.getFunctionManager().getFunctions(true);
         while (iterator.hasNext()) {
