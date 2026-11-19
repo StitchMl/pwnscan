@@ -56,7 +56,7 @@ def _dynamic_argument(argument: dict) -> bool:
 
 
 def _normalize_import_name(name: str) -> str:
-    tail = name.rsplit("::", 1)[-1]
+    tail = name.rsplit("::", 1)[-1].split("@", 1)[0]
     if tail.startswith("_") and not tail.startswith("__"):
         return tail[1:]
     return tail
@@ -527,21 +527,28 @@ def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
     return ScanReport("pwnscan/v1", target, hashlib.sha256(data).hexdigest(), len(data), info, analyze(info))
 
 
-def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict) -> List[dict]:
+def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict, ghidra_base: int = 0) -> List[dict]:
     resolved: List[dict] = []
     for item in calls:
         if not isinstance(item, dict):
             continue
         call = dict(item)
-        if not call.get("to") and plt_addresses:
+        current_to = call.get("to")
+        unresolved = not current_to or (isinstance(current_to, str) and current_to.startswith(("DAT_", "LAB_")))
+        if unresolved and plt_addresses:
             target = call.get("target")
             repr_text = target.get("repr") if isinstance(target, dict) else None
             if isinstance(repr_text, str):
                 match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
                 if match:
-                    addr_key = "0x%x" % int(match.group(1), 16)
-                    if addr_key in plt_addresses:
-                        call["to"] = plt_addresses[addr_key]
+                    addr = int(match.group(1), 16)
+                    for candidate in (addr, addr - ghidra_base if ghidra_base and addr >= ghidra_base else None):
+                        if candidate is None:
+                            continue
+                        addr_key = "0x%x" % candidate
+                        if addr_key in plt_addresses:
+                            call["to"] = plt_addresses[addr_key]
+                            break
         resolved.append(call)
     return sorted(resolved, key=lambda item: (str(item.get("to", "")), str(item.get("from", ""))))
 
@@ -571,10 +578,16 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
             continue
     metadata["symbol_addresses"] = {name: addresses[name] for name in sorted(addresses, key=str.lower)}
     plt_addresses = metadata.get("plt_addresses", {})
+    ghidra_base = 0
+    if isinstance(payload.get("image_base"), str):
+        try:
+            ghidra_base = int(payload["image_base"], 16)
+        except ValueError:
+            ghidra_base = 0
     metadata["ghidra"] = {
         "language": payload.get("language"),
         "image_base": payload.get("image_base"),
-        "calls": _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}),
+        "calls": _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base),
     }
     metadata["parsed_imports"] = sorted(set(metadata.get("parsed_imports", [])) | clean_imports, key=str.lower)
     return replace(

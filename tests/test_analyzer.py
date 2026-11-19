@@ -368,3 +368,38 @@ def test_ghidra_call_without_to_resolves_from_elf_plt_addresses(tmp_path):
     assert fmt.severity == "high"
     assert fmt.confidence == "high"
     assert "00401491 in func -> printf" in fmt.evidence[0]
+
+
+def test_ghidra_pie_image_base_and_dat_symbol_resolve_plt_and_strip_versions(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "pie_export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "image_base": "00100000",
+        "functions": [{"name": "main", "entry": "00101200"}],
+        "imports": ["EXTERNAL::free@GLIBC_2.2.5"],
+        "calls": [
+            {
+                "from": "00101731",
+                "function": "main",
+                "to": "DAT_00101110",
+                "indirect": False,
+                "target": {"kind": "dynamic", "repr": "(ram, 0x101110, 8)", "size": 8},
+                "arguments": [dynamic("ptr")],
+            },
+            {
+                "from": "00101833",
+                "function": "main",
+                "to": None,
+                "indirect": False,
+                "target": {"kind": "dynamic", "repr": "(ram, 0x101130, 8)", "size": 8},
+                "arguments": [dynamic("ptr")],
+            },
+        ],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x1110": "free", "0x1130": "puts"}}), export)
+    assert merged.metadata["parsed_imports"] == ["free"]
+    uaf = next(item for item in analyze(merged) if item.id == "PWN-HEAP-002")
+    assert "puts" in uaf.evidence[0]
+    assert "00101731" in uaf.evidence[0]
