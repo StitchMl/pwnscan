@@ -12,19 +12,26 @@ from .parsers import parse_binary
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s", "__isoc99_scanf": "may use an unbounded %s", "__isoc99_sscanf": "may use an unbounded %s", "__isoc99_fscanf": "may use an unbounded %s"}
-FORMAT_SINKS = {"printf", "fprintf", "syslog"}
+FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "syslog"}
+FORMAT_INDEXES = {
+    "printf": 0, "vprintf": 0,
+    "fprintf": 1, "dprintf": 1, "sprintf": 1, "vfprintf": 1, "vsprintf": 1, "syslog": 1,
+    "snprintf": 2, "vsnprintf": 2,
+}
 COMMAND_SINKS = {"system", "popen", "execve", "WinExec", "CreateProcess"}
 BOUNDED_WRITES = {
     "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2),
-    "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2),
+    "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2), "strncat": (0, 2),
+    "fgets": (0, 1), "snprintf": (0, 1),
 }
 DEALLOCATORS = {"free", "operator delete", "delete"}
 HEAP_DEREFERENCE_ARGUMENTS = {
-    "read": {1}, "recv": {1}, "recvfrom": {1}, "memcpy": {0, 1},
-    "memmove": {0, 1}, "strcpy": {0, 1}, "strcat": {0, 1},
+    "read": {1}, "recv": {1}, "recvfrom": {1}, "write": {1}, "send": {1}, "sendto": {1},
+    "memcpy": {0, 1}, "memmove": {0, 1}, "strcpy": {0, 1}, "strcat": {0, 1}, "strncat": {0, 1},
+    "fgets": {0}, "snprintf": {0}, "puts": {0}, "strlen": {0}, "realloc": {0},
 }
 ARITHMETIC_WRAP_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT", "INT_SUB"}
-WIDTH_CHANGE_OPS = {"INT_SEXT"}
+WIDTH_CHANGE_OPS = {"INT_SEXT", "SUBPIECE"}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
 
@@ -48,6 +55,13 @@ def _dynamic_argument(argument: dict) -> bool:
     return argument.get("kind") in {"dynamic", "stack"}
 
 
+def _normalize_import_name(name: str) -> str:
+    tail = name.rsplit("::", 1)[-1]
+    if tail.startswith("_") and not tail.startswith("__"):
+        return tail[1:]
+    return tail
+
+
 def _expression_ops(argument: dict) -> set[str]:
     result: set[str] = set()
     pending = [argument.get("expression")]
@@ -62,6 +76,29 @@ def _expression_ops(argument: dict) -> set[str]:
         if isinstance(inputs, list):
             pending.extend(inputs)
     return result
+
+
+def _expression_has_dynamic_input(argument: dict) -> bool:
+    pending = [argument.get("expression")]
+    saw_leaf = False
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, list) and inputs:
+            pending.extend(inputs)
+            continue
+        nested = node.get("expression")
+        if isinstance(nested, dict):
+            pending.append(nested)
+            continue
+        kind = node.get("kind")
+        if isinstance(kind, str):
+            saw_leaf = True
+            if kind != "constant":
+                return True
+    return not saw_leaf and _dynamic_argument(argument)
 
 
 def _argument_identity(argument: dict) -> str | None:
@@ -176,79 +213,81 @@ def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Seque
     return None
 
 
-def analyze(info: BinaryInfo) -> List[Finding]:
-    imports = set(info.imports)
-    symbols = set(info.symbols)
-    parsed_imports = set(info.metadata.get("parsed_imports", []))
-    string_hints = set(info.metadata.get("string_import_hints", []))
-    symbol_addresses = info.metadata.get("symbol_addresses", {})
-    ghidra_calls = info.metadata.get("ghidra", {}).get("calls", [])
-    findings: List[Finding] = []
+def _check_bounded_overflows(bounded: Sequence[dict]) -> Optional[Finding]:
+    if not bounded:
+        return None
+    evidence = []
+    validation = []
+    for item in bounded:
+        call = item["call"]
+        variable = item["destination"].get("variable") or "stack destination"
+        delta = item["requested"] - item["buffer_size"]
+        evidence.append(
+            "Ghidra call %s at %s in %s writes up to %d bytes into %s (%d bytes); overflow window %d bytes"
+            % (item["name"], call.get("from"), call.get("function") or "<unknown>", item["requested"], variable, item["buffer_size"], delta)
+        )
+        validation.append("Send exactly %d non-newline bytes to the input reaching %s and confirm saved-state corruption in a debugger." % (item["requested"], call.get("from")))
+    return _finding(
+        "PWN-BOUNDS-001", "Proven constant-length stack overwrite", "critical", "high", evidence,
+        "The decompiler recovered a destination smaller than the requested write. Use a cyclic pattern of the reported request length, measure the saved-state offset, then select ret2win or ROP from the reported mitigations and addresses.",
+        validation,
+        "Cap each write at the recovered destination size minus required terminator space and reject larger input before the call.",
+    )
 
-    bounded = _bounded_overflows(ghidra_calls)
-    if bounded:
-        evidence = []
-        validation = []
-        for item in bounded:
-            call = item["call"]
-            variable = item["destination"].get("variable") or "stack destination"
-            delta = item["requested"] - item["buffer_size"]
-            evidence.append(
-                "Ghidra call %s at %s in %s writes up to %d bytes into %s (%d bytes); overflow window %d bytes"
-                % (item["name"], call.get("from"), call.get("function") or "<unknown>", item["requested"], variable, item["buffer_size"], delta)
-            )
-            validation.append("Send exactly %d non-newline bytes to the input reaching %s and confirm saved-state corruption in a debugger." % (item["requested"], call.get("from")))
-        findings.append(_finding(
-            "PWN-BOUNDS-001", "Proven constant-length stack overwrite", "critical", "high", evidence,
-            "The decompiler recovered a destination smaller than the requested write. Use a cyclic pattern of the reported request length, measure the saved-state offset, then select ret2win or ROP from the reported mitigations and addresses.",
-            validation,
-            "Cap each write at the recovered destination size minus required terminator space and reject larger input before the call.",
-        ))
 
-    arithmetic_allocations = []
+def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     allocation_indexes = {"malloc": {0}, "calloc": {0, 1}, "realloc": {1}, "operator new": {0}, "new": {0}}
+    arithmetic_allocations = []
     for call in ghidra_calls:
         name = _call_name(call)
         for index in allocation_indexes.get(name, set()):
             argument = _call_argument(call, index)
             operations = _expression_ops(argument)
-            if operations & ARITHMETIC_WRAP_OPS:
+            if (operations & ARITHMETIC_WRAP_OPS) and _expression_has_dynamic_input(argument):
                 arithmetic_allocations.append((call, index, sorted(operations & ARITHMETIC_WRAP_OPS)))
-    if arithmetic_allocations:
-        evidence = [
-            "Ghidra traces %s argument %d at %s through %s"
-            % (_call_name(call), index, call.get("from"), ", ".join(operations))
-            for call, index, operations in arithmetic_allocations
-        ]
-        findings.append(_finding(
-            "PWN-INT-001", "Wrap-prone arithmetic controls an allocation size", "medium", "medium", evidence,
-            "Drive the reported count or element size toward the integer-width boundary. Confirm allocation wraps smaller than the later initialized element count before deriving a heap-overflow payload.",
-            ["Recover operand widths and input bounds in the decompiler.", "Break on the allocator and compare the requested byte count with the following write volume."],
-            "Reject operands above SIZE_MAX / element_size before multiplication and above SIZE_MAX - increment before addition.",
-        ))
+    if not arithmetic_allocations:
+        return None
+    evidence = [
+        "Ghidra traces %s argument %d at %s through %s"
+        % (_call_name(call), index, call.get("from"), ", ".join(operations))
+        for call, index, operations in arithmetic_allocations
+    ]
+    return _finding(
+        "PWN-INT-001", "Wrap-prone arithmetic controls an allocation size", "medium", "medium", evidence,
+        "Drive the reported count or element size toward the integer-width boundary. Confirm allocation wraps smaller than the later initialized element count before deriving a heap-overflow payload.",
+        ["Recover operand widths and input bounds in the decompiler.", "Break on the allocator and compare the requested byte count with the following write volume."],
+        "Reject operands above SIZE_MAX / element_size before multiplication and above SIZE_MAX - increment before addition.",
+    )
 
+
+def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     width_changed_lengths = []
     for call in ghidra_calls:
         name = _call_name(call)
         if name not in BOUNDED_WRITES:
             continue
         _, length_index = BOUNDED_WRITES[name]
-        operations = _expression_ops(_call_argument(call, length_index))
-        if operations & WIDTH_CHANGE_OPS:
+        argument = _call_argument(call, length_index)
+        operations = _expression_ops(argument)
+        if (operations & WIDTH_CHANGE_OPS) and _expression_has_dynamic_input(argument):
             width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
-    if width_changed_lengths:
-        findings.append(_finding(
-            "PWN-SIGN-001", "Width or signedness conversion controls a write length", "high", "medium",
-            [
-                "Ghidra traces %s length argument %d at %s through %s"
-                % (_call_name(call), index, call.get("from"), ", ".join(operations))
-                for call, index, operations in width_changed_lengths
-            ],
-            "Test boundary values -1, 0, the destination size, and the source type maximum. A negative value converted to size_t or a truncated large value can produce an oversized write; build a payload only after the debugger confirms that conversion.",
-            ["Recover source and destination integer types.", "Compare the validated value with the value passed to the write call."],
-            "Validate in the unsigned destination type before conversion, reject negatives, and use checked conversion helpers.",
-        ))
+    if not width_changed_lengths:
+        return None
+    return _finding(
+        "PWN-SIGN-001", "Width or signedness conversion controls a write length", "high", "medium",
+        [
+            "Ghidra traces %s length argument %d at %s through %s"
+            % (_call_name(call), index, call.get("from"), ", ".join(operations))
+            for call, index, operations in width_changed_lengths
+        ],
+        "Test boundary values -1, 0, the destination size, and the source type maximum. A negative value converted to size_t or a truncated large value can produce an oversized write; build a payload only after the debugger confirms that conversion.",
+        ["Recover source and destination integer types.", "Compare the validated value with the value passed to the write call."],
+        "Validate in the unsigned destination type before conversion, reject negatives, and use checked conversion helpers.",
+    )
 
+
+def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
+    findings: List[Finding] = []
     double_free, use_after_free = _heap_lifetime_candidates(ghidra_calls)
     if double_free:
         findings.append(_finding(
@@ -264,7 +303,10 @@ def analyze(info: BinaryInfo) -> List[Finding]:
             ["Confirm no reassignment dominates the later use.", "Use allocator tracing to prove the chunk was reclaimed."],
             "Invalidate aliases after free and enforce object lifetime through single ownership.",
         ))
+    return findings
 
+
+def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     stack_indirect = []
     other_indirect = []
     for call in ghidra_calls:
@@ -277,94 +319,111 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         )
         (stack_indirect if target.get("kind") == "stack" else other_indirect).append(entry)
     if stack_indirect:
-        findings.append(_finding(
+        return _finding(
             "PWN-CFLOW-001", "Stack-derived indirect call target", "high", "high", stack_indirect,
             "Map writes to the reported stack slot. If challenge input controls the full function pointer, redirect it to a compatible fixed success routine or validated gadget.",
             ["Confirm the target slot is writable from challenge input.", "Check the function signature and CFI policy before choosing a destination."],
             "Keep control-flow targets outside writable input buffers and enable CFI or CFG.",
-        ))
-    elif other_indirect:
-        findings.append(_finding(
+        )
+    if other_indirect:
+        return _finding(
             "PWN-CFLOW-001", "Indirect call requires target provenance review", "low", "low", other_indirect,
             "Trace the recovered function pointer or vtable to its last write. Continue only if challenge input controls that write.",
             ["Distinguish normal dispatch from a writable function pointer.", "Inspect all assignments reaching the call."],
             "Protect dispatch tables from untrusted writes and enable CFI or CFG.",
-        ))
+        )
+    return None
 
+
+def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports: set[str], string_hints: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     dangerous = sorted(imports & set(UNBOUNDED), key=str.lower)
-    if dangerous:
-        proven = sorted(set(dangerous) & parsed_imports, key=str.lower)
-        hints = sorted(set(dangerous) & string_hints, key=str.lower)
-        callsites = [item for item in ghidra_calls if str(item.get("to", "")).rsplit("::", 1)[-1] in dangerous]
-        reasons = (["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven] +
-                   ["unverified string hint: %s" % name for name in hints] +
-                   ["Ghidra reference: %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in callsites])
-        mitigations = info.mitigations
-        nx = mitigations.get("nx")
-        canary = mitigations.get("stack_canary")
-        if canary is False and nx is False:
-            vector = "Find the overwrite offset, control the return address, then jump to injected stack data or a win function."
-        elif canary is False:
-            vector = "Find the overwrite offset, control the return address, then build a ROP/ret2libc chain or jump to a win function."
-        else:
-            vector = "Trace attacker-controlled lengths to the destination. If a stack canary blocks return-address control, target adjacent data or leak the canary first."
-        findings.append(_finding(
-            "PWN-BOF-001", "Unbounded memory-write surface", "high" if callsites and "gets" in proven else ("medium" if proven else "low"), "high" if callsites and "gets" in proven else ("medium" if proven else "low"), reasons, vector,
-            ["Inspect each call site and destination size.", "Generate a cyclic pattern in an isolated challenge runner.", "Confirm control of saved state with a debugger."],
-            "Replace unbounded calls with length-aware APIs and reject input larger than the destination.",
-        ))
+    if not dangerous:
+        return None
+    dangerous_set = set(dangerous)
+    proven = sorted(dangerous_set & parsed_imports, key=str.lower)
+    hints = sorted(dangerous_set & string_hints, key=str.lower)
+    callsites = [
+        item for item in ghidra_calls
+        if str(item.get("to", "")).rsplit("::", 1)[-1] in dangerous_set
+        or _normalize_import_name(str(item.get("to", ""))) in dangerous_set
+    ]
+    reasons = (
+        ["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven]
+        + ["unverified string hint: %s" % name for name in hints]
+        + ["Ghidra reference: %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in callsites]
+    )
+    nx = info.mitigations.get("nx")
+    canary = info.mitigations.get("stack_canary")
+    if canary is False and nx is False:
+        vector = "Find the overwrite offset, control the return address, then jump to injected stack data or a win function."
+    elif canary is False:
+        vector = "Find the overwrite offset, control the return address, then build a ROP/ret2libc chain or jump to a win function."
+    else:
+        vector = "Trace attacker-controlled lengths to the destination. If a stack canary blocks return-address control, target adjacent data or leak the canary first."
+    level = "high" if callsites and "gets" in proven else ("medium" if proven else "low")
+    return _finding(
+        "PWN-BOF-001", "Unbounded memory-write surface", level, level, reasons, vector,
+        ["Inspect each call site and destination size.", "Generate a cyclic pattern in an isolated challenge runner.", "Confirm control of saved state with a debugger."],
+        "Replace unbounded calls with length-aware APIs and reject input larger than the destination.",
+    )
 
-    format_evidence = sorted(imports & FORMAT_SINKS, key=str.lower)
-    format_clues = sorted(value for value in info.strings if "%n" in value or re.search(r"%\d+\$[pxsn]", value))[:8]
-    parsed_format = sorted(set(format_evidence) & parsed_imports, key=str.lower)
-    dynamic_format_calls = []
-    format_indexes = {"printf": 0, "fprintf": 1, "syslog": 1}
-    for call in ghidra_calls:
-        name = _call_name(call)
-        if name in format_indexes and _dynamic_argument(_call_argument(call, format_indexes[name])):
-            dynamic_format_calls.append(call)
+
+def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+    dynamic_format_calls = [
+        call for call in ghidra_calls
+        if _call_name(call) in FORMAT_INDEXES and _dynamic_argument(_call_argument(call, FORMAT_INDEXES[_call_name(call)]))
+    ]
     if dynamic_format_calls:
         call_evidence = [
             "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to"))
             for item in dynamic_format_calls
         ]
-        findings.append(_finding(
+        return _finding(
             "PWN-FMT-001", "Attacker-reachable dynamic format candidate", "high", "high", call_evidence,
             "Send `%p.%p.%p` to confirm pointer disclosure. If the same input reaches `%n`, use a positional write only after mapping the argument index in the isolated CTF runner.",
             ["Compare output for a literal marker and `%p.%p.%p`.", "Confirm the decompiled format argument comes from challenge input."],
             "Pass a constant format such as `%s` and move the dynamic value to a separate argument.",
-        ))
-    elif parsed_format and format_clues:
-        findings.append(_finding(
+        )
+    parsed_format = sorted(imports & FORMAT_SINKS & parsed_imports, key=str.lower)
+    format_clues = sorted(value for value in info.strings if "%n" in value or re.search(r"%\d+\$[pxsn]", value))[:8]
+    if parsed_format and format_clues:
+        return _finding(
             "PWN-FMT-001", "Format-string review required", "medium", "low",
             ["parsed format sink: %s" % item for item in parsed_format] + ["format token in binary: %s" % item for item in format_clues],
             "Supply positional format specifiers to map the stack. Use reads to disclose pointers or a controlled %n write if the program passes user data as the format string.",
             ["Decompile each sink call and identify the format argument.", "Check whether input reaches that argument unchanged."],
             "Pass a constant format string and provide user data through a value argument.",
-        ))
+        )
+    return None
 
-    commands = sorted(parsed_imports & COMMAND_SINKS, key=str.lower)
+
+def _check_command_sinks(parsed_imports: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     dynamic_command_calls = [
         item for item in ghidra_calls
         if _call_name(item) in COMMAND_SINKS and _dynamic_argument(_call_argument(item, 0))
     ]
     if dynamic_command_calls:
-        findings.append(_finding(
+        return _finding(
             "PWN-CMD-001", "Dynamic command execution candidate", "high", "high",
             ["dynamic command at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in dynamic_command_calls],
             "The decompiler recovered a non-constant command argument. Preserve the known prefix and test a shell separator followed by `cat /flag` only inside the authorized challenge runner.",
             ["Inspect how input reaches the command argument.", "Record quoting, allowlists and the invoked shell before choosing a separator."],
             "Avoid shell command construction. Use fixed executable paths and validated argument arrays.",
-        ))
-    elif commands:
-        findings.append(_finding(
+        )
+    commands = sorted(parsed_imports & COMMAND_SINKS, key=str.lower)
+    if commands:
+        return _finding(
             "PWN-CMD-001", "Command execution sink requires data-flow review", "low", "low",
             ["parsed command sink without proven dynamic argument: %s" % name for name in commands],
             "Inspect the command argument. Build a flag-read probe only if challenge input reaches it after quoting and validation.",
             ["Decompile the sink call and trace argument zero."],
             "Keep the executable and argument vector constant or validate each token against an allowlist.",
-        ))
+        )
+    return None
 
+
+def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str], symbol_addresses: dict) -> List[Finding]:
+    findings: List[Finding] = []
     win_symbols = sorted(name for name in symbols if WIN_NAMES.search(name))
     win_strings = sorted((value for value in info.strings if FLAG_TEXT.search(value)), key=str.lower)[:12]
     exact_chain = _exact_ret2win(info, bounded, win_symbols, symbol_addresses)
@@ -375,7 +434,7 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         if addressed:
             chosen_name, chosen_address = addressed[0]
             pack = "p64" if info.bits == 64 else "p32"
-            target = "ELF-relative offset" if info.mitigations.get("pie") else "virtual address"
+            target = "image-relative offset" if info.mitigations.get("pie") else "virtual address"
             address_note = "%s %s=0x%x; scaffold: payload = b\"A\" * OFFSET + %s(0x%x)." % (target, chosen_name, chosen_address, pack, chosen_address)
         else:
             address_note = "PIE requires a code-pointer leak or relative transfer." if info.mitigations.get("pie") else "Resolve the routine address before building ret2win."
@@ -386,6 +445,48 @@ def analyze(info: BinaryInfo) -> List[Finding]:
             ["Cross-reference each clue.", "List callers and guard conditions for candidate success routines."],
             "Remove dormant privileged paths and keep secrets outside the challenge binary in production software.",
         ))
+    return findings
+
+
+def _check_mitigations(info: BinaryInfo) -> Optional[Finding]:
+    missing = [name for name in ("nx", "stack_canary", "pie" if info.format in {"ELF", "Mach-O"} else "aslr") if info.mitigations.get(name) is False]
+    if info.format == "ELF" and info.metadata.get("relro") in {"none", "partial"}:
+        missing.append("full_relro")
+    if info.format == "PE" and info.mitigations.get("cfg") is False:
+        missing.append("cfg")
+    if not missing:
+        return None
+    return _finding(
+        "PWN-MIT-001", "Exploit mitigations disabled", "medium", "high",
+        ["%s disabled" % name for name in sorted(missing)],
+        "Use the missing mitigations to simplify an existing memory-corruption vector: fixed code addresses help ROP, no canary helps stack overwrite, and executable memory helps shellcode.",
+        ["Confirm loader policy on the challenge host.", "Pair this finding with a controllable corruption primitive."],
+        "Enable compiler and linker hardening: stack protector, non-executable memory, PIE/ASLR, RELRO, and platform control-flow protection.",
+    )
+
+
+def analyze(info: BinaryInfo) -> List[Finding]:
+    imports = set(info.imports)
+    symbols = set(info.symbols)
+    parsed_imports = set(info.metadata.get("parsed_imports", []))
+    string_hints = set(info.metadata.get("string_import_hints", []))
+    symbol_addresses = info.metadata.get("symbol_addresses", {})
+    ghidra_calls = info.metadata.get("ghidra", {}).get("calls", [])
+    bounded = _bounded_overflows(ghidra_calls)
+
+    candidates: List[Optional[Finding]] = [
+        _check_bounded_overflows(bounded),
+        _check_integer_allocations(ghidra_calls),
+        _check_width_conversions(ghidra_calls),
+        _check_indirect_calls(ghidra_calls),
+        _check_unbounded_writes(info, imports, parsed_imports, string_hints, ghidra_calls),
+        _check_format_strings(info, imports, parsed_imports, ghidra_calls),
+        _check_command_sinks(parsed_imports, ghidra_calls),
+        _check_mitigations(info),
+    ]
+    findings: List[Finding] = [item for item in candidates if item is not None]
+    findings.extend(_check_heap_lifetime(ghidra_calls))
+    findings.extend(_check_win_paths(info, bounded, symbols, symbol_addresses))
 
     rwx_sections = list(info.metadata.get("rwx_sections", []))
     if rwx_sections:
@@ -400,30 +501,15 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     gadgets = info.metadata.get("gadgets", {})
     useful_strings = info.metadata.get("useful_strings", {})
     if gadgets or useful_strings:
-        evidence = []
-        for name, addresses in sorted(gadgets.items()):
-            evidence.append("%s: %s" % (name, ", ".join("0x%x" % value for value in addresses[:3])))
-        for value, addresses in sorted(useful_strings.items()):
-            evidence.append("string %r: %s" % (value, ", ".join("0x%x" % address for address in addresses)))
+        evidence = (
+            ["%s: %s" % (name, ", ".join("0x%x" % value for value in addresses[:3])) for name, addresses in sorted(gadgets.items())]
+            + ["string %r: %s" % (value, ", ".join("0x%x" % address for address in addresses)) for value, addresses in sorted(useful_strings.items())]
+        )
         findings.append(_finding(
             "PWN-ROP-001", "Addressed exploit primitives", "info", "high", evidence,
             "Use only primitives compatible with the architecture and mitigations. PIE addresses are image-relative until a base leak is known.",
             ["Validate instruction boundaries in a disassembler.", "Rebase addresses when PIE or ASLR is active."],
             "Reduce gadget density through control-flow protection; remove embedded command strings when unnecessary.",
-        ))
-
-    missing = [name for name in ("nx", "stack_canary", "pie" if info.format in {"ELF", "Mach-O"} else "aslr") if info.mitigations.get(name) is False]
-    if info.format == "ELF" and info.metadata.get("relro") in {"none", "partial"}:
-        missing.append("full_relro")
-    if info.format == "PE" and info.mitigations.get("cfg") is False:
-        missing.append("cfg")
-    if missing:
-        findings.append(_finding(
-            "PWN-MIT-001", "Exploit mitigations disabled", "medium", "high",
-            ["%s disabled" % name for name in sorted(missing)],
-            "Use the missing mitigations to simplify an existing memory-corruption vector: fixed code addresses help ROP, no canary helps stack overwrite, and executable memory helps shellcode.",
-            ["Confirm loader policy on the challenge host.", "Pair this finding with a controllable corruption primitive."],
-            "Enable compiler and linker hardening: stack protector, non-executable memory, PIE/ASLR, RELRO, and platform control-flow protection.",
         ))
 
     if not findings:
@@ -454,7 +540,7 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     if not isinstance(functions, list) or not isinstance(imports, list) or not isinstance(calls, list):
         raise ValueError("invalid Ghidra export structure")
     function_names = {item.get("name") for item in functions if isinstance(item, dict) and isinstance(item.get("name"), str)}
-    clean_imports = {value.rsplit("::", 1)[-1] for value in imports if isinstance(value, str)}
+    clean_imports = {_normalize_import_name(value) for value in imports if isinstance(value, str)}
     metadata = dict(info.metadata)
     addresses = dict(metadata.get("symbol_addresses", {}))
     for item in functions:

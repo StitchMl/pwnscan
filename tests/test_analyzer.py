@@ -267,3 +267,80 @@ def test_stack_derived_indirect_call_is_high_confidence_but_not_payload_ready():
 def test_partial_relro_is_reported_as_missing_full_relro():
     finding = next(item for item in analyze(info(metadata={"relro": "partial"})) if item.id == "PWN-MIT-001")
     assert "full_relro disabled" in finding.evidence
+
+
+def test_subpiece_truncation_in_write_length_is_reported():
+    length = dynamic("trunc_len", expression("SUBPIECE", {"kind": "dynamic", "repr": "wide_len", "size": 8}, {"kind": "constant", "value": 0, "size": 4}))
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401320", "function": "copy", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0}, dynamic("dst"), length,
+        ]},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-SIGN-001")
+    assert "SUBPIECE" in finding.evidence[0]
+
+
+def test_constant_only_arithmetic_allocation_is_not_reported():
+    const_size = {
+        "kind": "constant", "value": 192, "size": 8,
+        "expression": expression("INT_MULT", {"kind": "constant", "value": 4, "size": 4}, {"kind": "constant", "value": 48, "size": 4}),
+    }
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401200", "function": "init", "to": "malloc", "arguments": [const_size]},
+    ]}}))
+    assert not any(item.id == "PWN-INT-001" for item in findings)
+
+
+def test_fgets_constant_length_stack_overflow_is_proven():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401150", "function": "prompt", "to": "fgets", "arguments": [
+            {"kind": "stack", "stack_offset": -48, "buffer_size": 32, "variable": "buf"},
+            {"kind": "constant", "value": 128},
+            dynamic("stdin"),
+        ]},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-BOUNDS-001")
+    assert "overflow window 96 bytes" in finding.evidence[0]
+
+
+def test_snprintf_dynamic_format_argument_is_detected():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401180", "function": "log_msg", "to": "snprintf", "arguments": [
+            dynamic("out"), {"kind": "constant", "value": 64}, dynamic("user_fmt"),
+        ]},
+    ]}}))
+    finding = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert finding.severity == "high"
+    assert finding.confidence == "high"
+
+
+def test_post_free_read_and_realloc_are_reported_as_uaf():
+    pointer = dynamic("note")
+    calls = [
+        {"from": "00401010", "function": "show", "to": "free", "arguments": [pointer]},
+        {"from": "00401020", "function": "show", "to": "puts", "arguments": [pointer]},
+        {"from": "00401030", "function": "show", "to": "realloc", "arguments": [pointer, {"kind": "constant", "value": 64}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any("puts" in item for item in uaf.evidence)
+    assert any("realloc" in item for item in uaf.evidence)
+
+
+def test_underscore_prefixed_ghidra_callsite_and_import_normalization(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "functions": [{"name": "main", "entry": "100001000"}],
+        "imports": ["EXTERNAL::_gets", "EXTERNAL::__isoc99_scanf"],
+        "calls": [{"from": "100001020", "function": "main", "to": "_gets"}],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(format="Mach-O"), export)
+    assert "gets" in merged.metadata["parsed_imports"]
+    assert "__isoc99_scanf" in merged.metadata["parsed_imports"]
+    bof = next(item for item in analyze(merged) if item.id == "PWN-BOF-001")
+    assert bof.severity == "high"
+    assert bof.confidence == "high"
+    assert any("Ghidra reference:" in item for item in bof.evidence)
