@@ -107,3 +107,159 @@ def test_elf_shared_object_is_not_mislabeled_pie():
     assert info.metadata["elf_role"] == "shared_object"
     assert info.mitigations["pie"] is False
     assert info.mitigations["aslr"] is True
+
+
+def test_elf_static_pie_detected_via_df_1_pie():
+    data = bytearray(0x200)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 3, 62, 1, 0x1000, 0x40, 0, 0, 64, 56, 1, 64, 0, 0)
+    struct.pack_into("<IIQQQQQQ", data, 0x40, 2, 6, 0x100, 0x100, 0x100, 32, 32, 8)
+    struct.pack_into("<QQ", data, 0x100, 0x6FFFFFFB, 0x08000000)
+    struct.pack_into("<QQ", data, 0x110, 0, 0)
+    info = parse_binary(bytes(data))
+    assert info.metadata["elf_role"] == "pie"
+    assert info.mitigations["pie"] is True
+
+
+def test_elf_duplicate_section_names_nobits_and_canary_false_positive():
+    # Sections: 0=null, 1=.dup, 2=.dup (SHT_NOBITS overlapping .rodata), 3=.rodata, 4=.strtab, 5=.symtab, 6=.shstrtab
+    data = bytearray(0x400)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 2, 62, 1, 0x401000, 0, 0x200, 0, 64, 0, 0, 64, 7, 6)
+    data[0x100:0x11a] = b"/bin/sh\0__stack_chk_fail\0"
+    data[0x120:0x12a] = b"\0win\0gets\0"
+    struct.pack_into("<IBBHQQ", data, 0x158, 1, 0x12, 0, 1, 0x401000, 8)
+    struct.pack_into("<IBBHQQ", data, 0x170, 5, 0x12, 0, 0, 0, 0)
+    names = b"\0.dup\0.rodata\0.strtab\0.symtab\0.shstrtab\0"
+    data[0x190:0x190 + len(names)] = names
+    # 0: null
+    # 1: .dup (PROGBITS)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x240, 1, 1, 2, 0x402000, 0x188, 4, 0, 0, 1, 0)
+    # 2: .dup (NOBITS .bss-like, offset points at /bin/sh in .rodata but must be ignored)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x280, 1, 8, 3, 0x403000, 0x100, 32, 0, 0, 1, 0)
+    # 3: .rodata
+    struct.pack_into("<IIQQQQIIQQ", data, 0x2C0, 6, 1, 2, 0x402000, 0x100, 0x1a, 0, 0, 1, 0)
+    # 4: .strtab
+    struct.pack_into("<IIQQQQIIQQ", data, 0x300, 14, 3, 0, 0, 0x120, 10, 0, 0, 1, 0)
+    # 5: .symtab (sh_link=4)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x340, 22, 2, 0, 0, 0x140, 72, 4, 1, 8, 24)
+    # 6: .shstrtab
+    struct.pack_into("<IIQQQQIIQQ", data, 0x380, 30, 3, 0, 0, 0x190, len(names), 0, 0, 1, 0)
+    info = parse_binary(bytes(data))
+    assert info.metadata["parsed_imports"] == ["gets"]
+    assert info.metadata["symbol_addresses"] == {"win": 0x401000}
+    assert info.metadata["useful_strings"] == {"/bin/sh": [0x402000]}
+    assert info.mitigations["stack_canary"] is False
+
+
+def test_elf64_rejects_truncated_header():
+    data = bytearray(56)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    with pytest.raises(ParseError, match="truncated ELF64 header"):
+        parse_binary(bytes(data))
+
+
+def test_pe_rejects_short_optional_header_and_handles_missing_dll_chars():
+    data = bytearray(minimal_pe64())
+    struct.pack_into("<H", data, 0x84 + 16, 16)
+    with pytest.raises(ParseError, match="truncated PE optional header"):
+        parse_binary(bytes(data))
+
+    short_opt = bytearray(minimal_pe64())
+    struct.pack_into("<H", short_opt, 0x84 + 16, 40)
+    info = parse_binary(bytes(short_opt))
+    assert info.mitigations["nx"] is None
+    assert info.mitigations["aslr"] is None
+    assert info.mitigations["cfg"] is None
+
+
+def test_pe_imports_ignore_null_ilt_and_invalid_rvas_and_parses_exports():
+    data = bytearray(0x600)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
+    opt = 0x98
+    struct.pack_into("<H", data, opt, 0x20B)
+    struct.pack_into("<I", data, opt + 16, 0)  # no entrypoint (e.g. DLL)
+    struct.pack_into("<Q", data, opt + 24, 0x140000000)
+    struct.pack_into("<H", data, opt + 70, 0x0140)
+    # Export dir at RVA 0x2000 size 0x80; Import dir at RVA 0x2100 size 0x40
+    struct.pack_into("<II", data, opt + 112, 0x2000, 0x80)
+    struct.pack_into("<II", data, opt + 120, 0x2100, 0x40)
+    # Single section .rdata mapped VA=0x2000, size=0x400, raw=0x200
+    sec = opt + 0xF0
+    data[sec:sec + 8] = b".rdata\0\0"
+    struct.pack_into("<IIIIII", data, sec + 8, 0x400, 0x2000, 0x400, 0x200, 0, 0)
+    struct.pack_into("<I", data, sec + 36, 0x40000040)
+
+    # Export directory at raw 0x200 (RVA 0x2000): 2 functions, 2 names
+    struct.pack_into("<IIHHIIIIIII", data, 0x200, 0, 0, 0, 0, 0, 1, 2, 2, 0x2030, 0x2040, 0x2050)
+    struct.pack_into("<II", data, 0x230, 0x1050, 0x2010)  # win=0x1050, fwd inside export dir
+    struct.pack_into("<II", data, 0x240, 0x2060, 0x2064)
+    struct.pack_into("<HH", data, 0x250, 0, 1)
+    data[0x260:0x268] = b"win\0fwd\0"
+
+    # Import descriptors at raw 0x300 (RVA 0x2100):
+    # 1) broken descriptor with original=0, thunk=0, name_rva=0x2200 -> must NOT read MZ
+    # 2) descriptor with thunk=0x2140 pointing to unmapped RVA 0x999900 and valid gets at 0x2160
+    struct.pack_into("<IIIII", data, 0x300, 0, 0, 0, 0x2200, 0)
+    struct.pack_into("<IIIII", data, 0x314, 0, 0, 0, 0x2200, 0x2140)
+    struct.pack_into("<QQQ", data, 0x340, 0x999900, 0x2160, 0)
+    data[0x360:0x367] = b"\0\0gets\0"
+
+    info = parse_binary(bytes(data))
+    assert info.entrypoint is None
+    assert info.metadata["parsed_imports"] == ["gets"]
+    assert "MZ" not in info.imports
+    assert info.symbols == ["fwd", "win"]
+    assert info.metadata["symbol_addresses"] == {"win": 0x140001050}
+
+
+def test_macho_symtab_unixstack_initprot_and_fat_rejection():
+    # 64-bit Mach-O with __TEXT, __UNIXSTACK (initprot=7), LC_MAIN, LC_SYMTAB
+    data = bytearray(0x300)
+    # 3 load commands, flags=MH_PIE
+    struct.pack_into("<IIIIIIII", data, 0, 0xFEEDFACF, 0x01000007, 3, 2, 4, 240, 0x200000, 0)
+    at = 32
+    # 1: LC_SEGMENT_64 __TEXT vmaddr=0x100000000 initprot=5
+    struct.pack_into("<II16sQQQQIIII", data, at, 0x19, 72, b"__TEXT", 0x100000000, 0x1000, 0, 0x300, 5, 5, 0, 0)
+    at += 72
+    # 2: LC_SEGMENT_64 __UNIXSTACK initprot=7 (RWX)
+    struct.pack_into("<II16sQQQQIIII", data, at, 0x19, 72, b"__UNIXSTACK", 0x200000000, 0x1000, 0, 0, 7, 7, 0, 0)
+    at += 72
+    # 3: LC_MAIN entryoff=0x1200
+    struct.pack_into("<IIQQ", data, at, 0x80000028, 24, 0x1200, 0)
+    at += 24
+    # 4: LC_SYMTAB symoff=0x180, nsyms=2, stroff=0x1c0, strsize=32
+    struct.pack_into("<IIIIII", data, at, 0x2, 24, 0x180, 2, 0x1C0, 32)
+    data[0x1C0:0x1CF] = b"\0_win\0_gets\0"
+    # nlist_64: _win defined (N_SECT=0xE, n_sect=1) at 0x100001300; _gets undefined external (N_UNDF|N_EXT=0x1)
+    struct.pack_into("<IBBHQ", data, 0x180, 1, 0x0E, 1, 0, 0x100001300)
+    struct.pack_into("<IBBHQ", data, 0x190, 6, 0x01, 0, 0, 0)
+    data[0x200:0x212] = b"___stack_chk_fail\0"
+
+    info = parse_binary(bytes(data))
+    assert info.entrypoint == 0x100001200
+    assert info.mitigations["nx"] is False
+    assert info.mitigations["stack_canary"] is False
+    assert info.metadata["rwx_sections"] == ["__UNIXSTACK"]
+    assert info.metadata["parsed_imports"] == ["gets"]
+    assert info.symbols == ["gets", "win"]
+    assert info.metadata["symbol_addresses"] == {"win": 0x100001300}
+
+    # 32-bit Mach-O __UNIXSTACK with maxprot=7, initprot=3, nsects=4 (must NOT trigger NX=False)
+    macho32 = bytearray(28 + 56)
+    struct.pack_into("<IIIIIII", macho32, 0, 0xFEEDFACE, 7, 3, 2, 1, 56, 0)
+    struct.pack_into("<II16sIIIIIIII", macho32, 28, 0x1, 56, b"__UNIXSTACK", 0, 0x1000, 0, 0, 7, 3, 4, 0)
+    assert parse_binary(bytes(macho32)).mitigations["nx"] is True
+
+    # Fat Mach-O header
+    fat = struct.pack(">II", 0xCAFEBABE, 2) + b"\0" * 40
+    with pytest.raises(ParseError, match="thin slice"):
+        parse_binary(fat)
