@@ -7,6 +7,7 @@
 import json
 
 from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.data import Array, Structure, TypeDef
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.program.model.symbol import ExternalReference
 from java.io import File
@@ -104,6 +105,21 @@ def _expression(varnode, depth=0, seen=None):
     return {"op": operation.getMnemonic(), "size": varnode.getSize(), "inputs": inputs}
 
 
+def _read_ascii_string(program, address):
+    chars = []
+    try:
+        for index in range(256):
+            value = program.getMemory().getByte(address.add(index)) & 0xFF
+            if value == 0:
+                return "".join(chars) if chars else None
+            if (value < 0x20 or value > 0x7E) and value not in (9, 10, 13):
+                return None
+            chars.append(chr(value))
+    except Exception:
+        return None
+    return None
+
+
 def _argument(program, function, varnode):
     item = {"kind": "dynamic", "repr": str(varnode), "size": varnode.getSize()}
     const_value = _constant_address_value(varnode)
@@ -114,6 +130,10 @@ def _argument(program, function, varnode):
             block = program.getMemory().getBlock(address)
             if block is not None:
                 item.update({"kind": "address_constant", "address": str(address), "block": block.getName(), "writable": bool(block.isWrite()), "executable": bool(block.isExecute())})
+                if not block.isWrite():
+                    text = _read_ascii_string(program, address)
+                    if text is not None:
+                        item["string"] = text
         except Exception:
             pass
     offset = _stack_offset(program, varnode)
@@ -126,7 +146,14 @@ def _argument(program, function, varnode):
                 item["return_address_offset"] = overwrite_offset
             variable = function.getStackFrame().getVariableContaining(offset)
             if variable is not None:
-                item.update({"buffer_size": variable.getLength(), "variable": variable.getName()})
+                item["variable"] = variable.getName()
+                data_type = variable.getDataType()
+                while isinstance(data_type, TypeDef):
+                    data_type = data_type.getBaseDataType()
+                if isinstance(data_type, (Array, Structure)):
+                    remaining = (variable.getStackOffset() + variable.getLength()) - offset
+                    if remaining > 0:
+                        item["buffer_size"] = remaining
         except Exception:
             pass
     try:
@@ -185,6 +212,9 @@ def _decompiled_calls(program, monitor):
     while iterator.hasNext():
         function = iterator.next()
         if function.isThunk():
+            continue
+        block = program.getMemory().getBlock(function.getEntryPoint())
+        if block is not None and block.getName().startswith(".plt"):
             continue
         completed = interface.decompileFunction(function, 30, monitor)
         high = completed.getHighFunction() if completed is not None and completed.decompileCompleted() else None

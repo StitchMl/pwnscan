@@ -424,3 +424,108 @@ def test_fortify_source_disabled_and_chk_format_argument():
         ]},
     ]}}))
     assert not any(item.id == "PWN-FMT-001" for item in const_chk)
+
+
+def test_untyped_stack_read_within_return_offset_is_not_bounds_overflow():
+    findings = analyze(info(
+        imports=["read"],
+        metadata={"parsed_imports": ["read"], "ghidra": {"calls": [
+            {"from": "00101693", "function": "func", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "stack", "stack_offset": -988, "return_address_offset": 988, "variable": "local_3dc"},
+                {"kind": "constant", "value": 947},
+            ]},
+        ]}},
+    ))
+    assert not any(item.id == "PWN-BOUNDS-001" for item in findings)
+
+    overflow = analyze(info(
+        imports=["read"],
+        metadata={"parsed_imports": ["read"], "ghidra": {"calls": [
+            {"from": "00101693", "function": "func", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "stack", "stack_offset": -80, "return_address_offset": 80, "variable": "local_50"},
+                {"kind": "constant", "value": 256},
+            ]},
+        ]}},
+    ))
+    assert any(item.id == "PWN-BOUNDS-001" for item in overflow)
+
+
+def test_bounded_scanf_format_suppresses_unbounded_bof_finding():
+    bounded = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401d10", "function": "challenge", "to": "__isoc99_scanf", "arguments": [
+                {"kind": "address_constant", "address": "0040354c", "writable": False, "string": "%127s%*c"},
+                {"kind": "stack", "stack_offset": -152, "return_address_offset": 152, "variable": "local_98"},
+            ]},
+        ]}},
+    ))
+    assert not any(item.id == "PWN-BOF-001" for item in bounded)
+
+    unbounded = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401d10", "function": "challenge", "to": "__isoc99_scanf", "arguments": [
+                {"kind": "address_constant", "address": "0040354c", "writable": False, "string": "%s"},
+                {"kind": "stack", "stack_offset": -152, "return_address_offset": 152, "variable": "local_98"},
+            ]},
+        ]}},
+    ))
+    assert any(item.id == "PWN-BOF-001" for item in unbounded)
+
+
+def test_file_stream_overwrite_and_post_close_use_are_detected():
+    fp_arg = {"kind": "dynamic", "repr": "(ram, 0x404208, 8)", "high_name": "fp"}
+    findings = analyze(info(
+        imports=["fopen", "fclose", "fwrite", "read"],
+        metadata={"parsed_imports": ["fopen", "fclose", "fwrite", "read"], "ghidra": {"calls": [
+            {"from": "00401f3c", "function": "challenge", "to": "fclose", "arguments": [fp_arg]},
+            {"from": "00402004", "function": "challenge", "to": "fwrite", "arguments": [
+                dynamic("buf"), {"kind": "constant", "value": 1}, {"kind": "constant", "value": 64}, fp_arg,
+            ]},
+            {"from": "0040204b", "function": "challenge", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0}, fp_arg, {"kind": "constant", "value": 480},
+            ]},
+        ]}},
+    ))
+    file_finding = next(item for item in findings if item.id == "PWN-FILE-001")
+    assert file_finding.severity == "high"
+    assert any("writes into FILE stream fp" in item for item in file_finding.evidence)
+    assert any("after fclose" in item for item in file_finding.evidence)
+
+    stderr_findings = analyze(info(
+        imports=["read"],
+        metadata={"parsed_imports": ["read"], "ghidra": {"calls": [
+            {"from": "00101304", "function": "challenge", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "dynamic", "repr": "(ram, 0x104040, 8)", "high_name": "stderr"},
+                {"kind": "constant", "value": 480},
+            ]},
+        ]}},
+    ))
+    assert any(item.id == "PWN-FILE-001" for item in stderr_findings)
+
+
+def test_crt_indirect_calls_are_ignored_while_user_indirect_calls_remain():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00101014", "function": "_init", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(unique, 0x1000001a, 8)"}, "arguments": []},
+        {"from": "00101208", "function": "_start", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(unique, 0x10000049, 8)"}, "arguments": []},
+        {"from": "00101999", "function": "__libc_csu_init", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(unique, 0x1000008a, 8)"}, "arguments": []},
+    ]}}))
+    assert not any(item.id == "PWN-CFLOW-001" for item in findings)
+
+    user_findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00101400", "function": "dispatch", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(ram, 0x104010, 8)"}, "arguments": []},
+    ]}}))
+    assert any(item.id == "PWN-CFLOW-001" for item in user_findings)
+
+
+def test_fwrite_after_free_is_reported_as_uaf():
+    pointer = dynamic("note")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401ea8", "function": "challenge", "to": "free", "arguments": [pointer]},
+        {"from": "00402004", "function": "challenge", "to": "fwrite", "arguments": [pointer, {"kind": "constant", "value": 1}, {"kind": "constant", "value": 16}, dynamic("fp")]},
+    ]}}))
+    assert any(item.id == "PWN-HEAP-002" for item in findings)

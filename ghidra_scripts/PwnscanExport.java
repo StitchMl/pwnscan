@@ -7,6 +7,10 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.data.Array;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
@@ -117,6 +121,26 @@ public class PwnscanExport extends GhidraScript {
         return null;
     }
 
+    private String readAsciiString(Program program, Address address) {
+        StringBuilder builder = new StringBuilder();
+        try {
+            for (int index = 0; index < 256; index++) {
+                byte value = program.getMemory().getByte(address.add(index));
+                if (value == 0) {
+                    return builder.length() > 0 ? builder.toString() : null;
+                }
+                int unsigned = value & 0xff;
+                if ((unsigned < 0x20 || unsigned > 0x7e) && unsigned != '\t' && unsigned != '\n' && unsigned != '\r') {
+                    return null;
+                }
+                builder.append((char) unsigned);
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+        return null;
+    }
+
     private Map<String, Object> argument(Program program, Function function, Varnode node) {
         Map<String, Object> item = new LinkedHashMap<>();
         item.put("kind", "dynamic");
@@ -136,6 +160,10 @@ public class PwnscanExport extends GhidraScript {
                     item.put("block", block.getName());
                     item.put("writable", block.isWrite());
                     item.put("executable", block.isExecute());
+                    if (!block.isWrite()) {
+                        String text = readAsciiString(program, address);
+                        if (text != null) item.put("string", text);
+                    }
                 }
             } catch (RuntimeException ignored) {
                 // Preserve the numeric constant when it is not a valid address.
@@ -151,8 +179,16 @@ public class PwnscanExport extends GhidraScript {
                 if (overwriteOffset > 0) item.put("return_address_offset", overwriteOffset);
                 Variable variable = function.getStackFrame().getVariableContaining((int) (long) offset);
                 if (variable != null) {
-                    item.put("buffer_size", variable.getLength());
                     item.put("variable", variable.getName());
+                    DataType dataType = variable.getDataType();
+                    while (dataType instanceof TypeDef) {
+                        dataType = ((TypeDef) dataType).getBaseDataType();
+                    }
+                    if (dataType instanceof Array || dataType instanceof Structure) {
+                        long endOffset = (long) variable.getStackOffset() + variable.getLength();
+                        long remaining = endOffset - offset;
+                        if (remaining > 0) item.put("buffer_size", remaining);
+                    }
                 }
             } catch (RuntimeException ignored) {
                 // Ghidra may not recover a stack variable for the address.
@@ -212,6 +248,8 @@ public class PwnscanExport extends GhidraScript {
             while (functions.hasNext() && !monitor.isCancelled()) {
                 Function function = functions.next();
                 if (function.isThunk()) continue;
+                MemoryBlock fnBlock = program.getMemory().getBlock(function.getEntryPoint());
+                if (fnBlock != null && fnBlock.getName().startsWith(".plt")) continue;
                 DecompileResults completed = decompiler.decompileFunction(function, 30, monitor);
                 HighFunction high = completed != null && completed.decompileCompleted() ? completed.getHighFunction() : null;
                 if (high == null) continue;

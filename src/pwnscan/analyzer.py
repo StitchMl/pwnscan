@@ -35,6 +35,31 @@ HEAP_DEREFERENCE_ARGUMENTS = {
     "read": {1}, "recv": {1}, "recvfrom": {1}, "write": {1}, "send": {1}, "sendto": {1},
     "memcpy": {0, 1}, "memmove": {0, 1}, "strcpy": {0, 1}, "strcat": {0, 1}, "strncat": {0, 1},
     "fgets": {0}, "snprintf": {0}, "puts": {0}, "strlen": {0}, "realloc": {0},
+    "fwrite": {0}, "fread": {0}, "fputs": {0},
+}
+SCANF_FORMAT_INDEX = {
+    "scanf": 0, "__isoc99_scanf": 0, "vscanf": 0,
+    "sscanf": 1, "__isoc99_sscanf": 1, "vsscanf": 1,
+    "fscanf": 1, "__isoc99_fscanf": 1, "vfscanf": 1,
+}
+SCANF_SPEC_RE = re.compile(r"%(\*)?(?:\d+\$)?(\d+)?(?:hh|h|ll|l|j|z|t|L|m|a)?([diuoxXfFeEgGaAcspn\[])")
+CRT_FUNCTIONS = frozenset({
+    "_init", "_fini", "_start", "__libc_csu_init", "__libc_csu_fini",
+    "__do_global_dtors_aux", "deregister_tm_clones", "register_tm_clones",
+    "frame_dummy", "_dl_relocate_static_pie",
+})
+STANDARD_FILE_STREAMS = frozenset({"stdin", "stdout", "stderr"})
+FILE_STREAM_ARGS = {
+    "fclose": {0}, "fflush": {0}, "fseek": {0}, "ftell": {0}, "rewind": {0},
+    "feof": {0}, "ferror": {0}, "clearerr": {0}, "fileno": {0}, "setbuf": {0}, "setvbuf": {0},
+    "fgetc": {0}, "getc": {0}, "ungetc": {1}, "fputc": {1}, "putc": {1}, "fputs": {1},
+    "fgets": {2}, "fprintf": {0}, "vfprintf": {0}, "fscanf": {0}, "__isoc99_fscanf": {0},
+    "vfscanf": {0}, "fread": {3}, "fwrite": {3},
+}
+FILE_WRITE_DESTS = {
+    "read": 1, "recv": 1, "recvfrom": 1, "read_chk": 1, "recv_chk": 1,
+    "fread": 0, "fgets": 0, "fgets_chk": 0, "gets": 0, "gets_chk": 0,
+    "memcpy": 0, "memmove": 0, "strcpy": 0, "stpcpy": 0, "strncpy": 0, "strcat": 0, "strncat": 0,
 }
 ARITHMETIC_WRAP_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT", "INT_SUB"}
 WIDTH_CHANGE_OPS = {"INT_SEXT", "SUBPIECE"}
@@ -176,9 +201,19 @@ def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
         destination = _call_argument(call, destination_index)
         length = _call_argument(call, length_index)
         buffer_size = destination.get("buffer_size")
+        return_offset = destination.get("return_address_offset")
+        if isinstance(buffer_size, int) and buffer_size > 0:
+            capacity, capacity_kind = buffer_size, "buffer_size"
+        elif isinstance(return_offset, int) and return_offset > 0:
+            capacity, capacity_kind = return_offset, "return_address_offset"
+        else:
+            continue
         requested = length.get("value") if length.get("kind") == "constant" else None
-        if isinstance(buffer_size, int) and buffer_size > 0 and isinstance(requested, int) and requested > buffer_size:
-            result.append({"call": call, "name": name, "buffer_size": buffer_size, "requested": requested, "destination": destination})
+        if isinstance(requested, int) and requested > capacity:
+            result.append({
+                "call": call, "name": name, "buffer_size": capacity,
+                "capacity_kind": capacity_kind, "requested": requested, "destination": destination,
+            })
     return result
 
 
@@ -232,9 +267,13 @@ def _check_bounded_overflows(bounded: Sequence[dict]) -> Optional[Finding]:
         call = item["call"]
         variable = item["destination"].get("variable") or "stack destination"
         delta = item["requested"] - item["buffer_size"]
+        if item.get("capacity_kind") == "return_address_offset":
+            detail = "past saved return offset of %s" % variable
+        else:
+            detail = "into %s" % variable
         evidence.append(
-            "Ghidra call %s at %s in %s writes up to %d bytes into %s (%d bytes); overflow window %d bytes"
-            % (item["name"], call.get("from"), call.get("function") or UNKNOWN, item["requested"], variable, item["buffer_size"], delta)
+            "Ghidra call %s at %s in %s writes up to %d bytes %s (%d bytes); overflow window %d bytes"
+            % (item["name"], call.get("from"), call.get("function") or UNKNOWN, item["requested"], detail, item["buffer_size"], delta)
         )
         validation.append("Send exactly %d non-newline bytes to the input reaching %s and confirm saved-state corruption in a debugger." % (item["requested"], call.get("from")))
     return _finding(
@@ -323,11 +362,15 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
         if call.get("indirect") is not True:
             continue
         target = call.get("target") if isinstance(call.get("target"), dict) else {}
+        function = call.get("function") or UNKNOWN
+        is_stack = target.get("kind") == "stack"
+        if not is_stack and function in CRT_FUNCTIONS:
+            continue
         entry = "indirect call at %s in %s; target %s" % (
-            call.get("from"), call.get("function") or UNKNOWN,
+            call.get("from"), function,
             _argument_identity(target) or target.get("repr") or "not recovered",
         )
-        (stack_indirect if target.get("kind") == "stack" else other_indirect).append(entry)
+        (stack_indirect if is_stack else other_indirect).append(entry)
     if stack_indirect:
         return _finding(
             "PWN-CFLOW-001", "Stack-derived indirect call target", "high", "high", stack_indirect,
@@ -345,8 +388,47 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     return None
 
 
+def _normalized_call_name(call: dict) -> str:
+    return _normalize_import_name(str(call.get("to") or ""))
+
+
+def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
+    format_arg = _call_argument(call, format_index)
+    format_str = format_arg.get("string") if format_arg.get("kind") == "address_constant" else None
+    if not isinstance(format_str, str) or not format_str:
+        return False
+    dest_index = format_index + 1
+    for match in SCANF_SPEC_RE.finditer(format_str.replace("%%", "")):
+        suppressed, width_text, conversion = match.groups()
+        if suppressed:
+            continue
+        if conversion in {"s", "["}:
+            if not width_text:
+                return False
+            width = int(width_text)
+            dest = _call_argument(call, dest_index)
+            capacity = dest.get("buffer_size") or dest.get("return_address_offset")
+            if isinstance(capacity, int) and capacity > 0 and width + 1 > capacity:
+                return False
+        dest_index += 1
+    return True
+
+
+def _bounded_scanf_imports(ghidra_calls: Sequence[dict]) -> set[str]:
+    calls_by_name: dict[str, list[dict]] = {}
+    for call in ghidra_calls:
+        name = _normalized_call_name(call)
+        if name in SCANF_FORMAT_INDEX:
+            calls_by_name.setdefault(name, []).append(call)
+    return {
+        name for name, matching in calls_by_name.items()
+        if all(_scanf_call_is_bounded(call, SCANF_FORMAT_INDEX[name]) for call in matching)
+    }
+
+
 def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports: set[str], string_hints: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
-    dangerous = sorted(imports & set(UNBOUNDED), key=str.lower)
+    bounded_scanf = _bounded_scanf_imports(ghidra_calls)
+    dangerous = sorted((imports & set(UNBOUNDED)) - bounded_scanf, key=str.lower)
     if not dangerous:
         return None
     dangerous_set = set(dangerous)
@@ -487,6 +569,71 @@ def _check_mitigations(info: BinaryInfo) -> Optional[Finding]:
     )
 
 
+def _collect_file_stream_identities(ghidra_calls: Sequence[dict]) -> tuple[set[tuple[str, str]], set[str]]:
+    local_streams: set[tuple[str, str]] = set()
+    global_streams: set[str] = set()
+    for call in ghidra_calls:
+        name = _normalized_call_name(call)
+        indexes = FILE_STREAM_ARGS.get(name, set())
+        if not indexes:
+            continue
+        function = str(call.get("function") or UNKNOWN)
+        for index in indexes:
+            argument = _call_argument(call, index)
+            identity = _argument_identity(argument)
+            if identity is None:
+                continue
+            local_streams.add((function, identity))
+            repr_text = argument.get("repr")
+            if identity.startswith("high:"):
+                global_streams.add(identity)
+            if isinstance(repr_text, str) and repr_text.startswith("(ram,"):
+                global_streams.add("repr:%s" % repr_text)
+    return local_streams, global_streams
+
+
+def _is_file_stream_argument(argument: dict, function: str, local_streams: set[tuple[str, str]], global_streams: set[str]) -> bool:
+    if argument.get("high_name") in STANDARD_FILE_STREAMS:
+        return True
+    identity = _argument_identity(argument)
+    if identity is not None and ((function, identity) in local_streams or identity in global_streams):
+        return True
+    repr_text = argument.get("repr")
+    return isinstance(repr_text, str) and ("repr:%s" % repr_text) in global_streams
+
+
+def _check_file_streams(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+    local_streams, global_streams = _collect_file_stream_identities(ghidra_calls)
+    evidence: list[str] = []
+    closed: dict[tuple[str, str], dict] = {}
+    for call in sorted(ghidra_calls, key=_call_position):
+        name = _normalized_call_name(call)
+        function = str(call.get("function") or UNKNOWN)
+        if name in FILE_WRITE_DESTS:
+            dst = _call_argument(call, FILE_WRITE_DESTS[name])
+            if _is_file_stream_argument(dst, function, local_streams, global_streams):
+                label = dst.get("high_name") if dst.get("high_name") not in {None, "UNNAMED", "null"} else (_argument_identity(dst) or "FILE*")
+                evidence.append("Ghidra call %s at %s in %s writes into FILE stream %s" % (name, call.get("from"), function, label))
+        if name == "fclose":
+            identity = _argument_identity(_call_argument(call, 0))
+            if identity is not None:
+                closed.setdefault((function, identity), call)
+        elif name in FILE_STREAM_ARGS and name not in {"setbuf", "setvbuf"}:
+            for index in FILE_STREAM_ARGS[name]:
+                identity = _argument_identity(_call_argument(call, index))
+                previous = closed.get((function, identity or ""))
+                if previous is not None:
+                    evidence.append("%s uses FILE stream %s in %s at %s after fclose at %s" % (name, identity, function, call.get("from"), previous.get("from")))
+    if not evidence:
+        return None
+    return _finding(
+        "PWN-FILE-001", "Input or write targets a FILE stream structure", "high", "high", evidence,
+        "Inspect what fields of the _IO_FILE structure can be overwritten (flags, _IO_read_*/_IO_write_*, _fileno, or vtable/wide_data) before subsequent stdio calls flush or close the stream.",
+        ["Verify in a debugger whether attacker bytes overwrite the live FILE structure.", "Check glibc version and vtable pointer validation before testing FSOP primitives."],
+        "Read untrusted input into a dedicated byte buffer rather than a FILE structure, and clear FILE pointers immediately after fclose.",
+    )
+
+
 def analyze(info: BinaryInfo) -> List[Finding]:
     imports = set(info.imports)
     symbols = set(info.symbols)
@@ -503,6 +650,7 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         _check_indirect_calls(ghidra_calls),
         _check_unbounded_writes(info, imports, parsed_imports, string_hints, ghidra_calls),
         _check_format_strings(info, imports, parsed_imports, ghidra_calls),
+        _check_file_streams(ghidra_calls),
         _check_command_sinks(parsed_imports, ghidra_calls),
         _check_mitigations(info),
     ]
