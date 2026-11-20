@@ -211,6 +211,7 @@ public class PwnscanExport extends GhidraScript {
             FunctionIterator functions = program.getFunctionManager().getFunctions(true);
             while (functions.hasNext() && !monitor.isCancelled()) {
                 Function function = functions.next();
+                if (function.isThunk()) continue;
                 DecompileResults completed = decompiler.decompileFunction(function, 30, monitor);
                 HighFunction high = completed != null && completed.decompileCompleted() ? completed.getHighFunction() : null;
                 if (high == null) continue;

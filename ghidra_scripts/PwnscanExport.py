@@ -131,6 +131,8 @@ def _decompiled_calls(program, monitor):
     iterator = program.getFunctionManager().getFunctions(True)
     while iterator.hasNext():
         function = iterator.next()
+        if function.isThunk():
+            continue
         completed = interface.decompileFunction(function, 30, monitor)
         high = completed.getHighFunction() if completed is not None and completed.decompileCompleted() else None
         if high is None:
