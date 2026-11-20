@@ -8,7 +8,6 @@ from pathlib import Path
 from . import __version__
 from .analyzer import SEVERITY_ORDER, scan_file
 from .ghidra import GhidraError, export_headless
-from .parsers import ParseError
 from .report import render_json, render_text, use_color
 
 
@@ -30,6 +29,31 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _check_args(args: argparse.Namespace) -> None:
+    if args.ghidra and args.ghidra_auto:
+        raise ValueError("choose either --ghidra or --ghidra-auto")
+    if args.ghidra_timeout < 1:
+        raise ValueError("--ghidra-timeout must be positive")
+    if args.output is not None:
+        output = args.output.resolve()
+        if output.is_dir() or not output.parent.is_dir():
+            raise ValueError("invalid output path: %s" % args.output)
+
+
+def _render(args: argparse.Namespace, report) -> str:
+    if args.output_format == "json":
+        return render_json(report, args.pretty) + "\n"
+    color_mode = "never" if (args.output is not None and args.color == "auto") else args.color
+    return render_text(report, use_color(color_mode))
+
+
+def _filtered(args: argparse.Namespace, report):
+    if not args.min_severity:
+        return report
+    threshold = SEVERITY_ORDER[args.min_severity]
+    return replace(report, findings=[item for item in report.findings if SEVERITY_ORDER[item.severity] <= threshold])
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
     if not args.target.is_file():
@@ -37,25 +61,16 @@ def main(argv=None) -> int:
         return 2
     generated_export = None
     try:
-        if args.ghidra and args.ghidra_auto:
-            raise ValueError("choose either --ghidra or --ghidra-auto")
-        if args.ghidra_timeout < 1:
-            raise ValueError("--ghidra-timeout must be positive")
-        generated_export = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout) if args.ghidra_auto else None
-        report = scan_file(args.target, generated_export or args.ghidra)
-        if args.min_severity:
-            threshold = SEVERITY_ORDER[args.min_severity]
-            report = replace(report, findings=[item for item in report.findings if SEVERITY_ORDER[item.severity] <= threshold])
-        if args.output_format == "json":
-            rendered = render_json(report, args.pretty) + "\n"
-        else:
-            color_mode = "never" if (args.output is not None and args.color == "auto") else args.color
-            rendered = render_text(report, use_color(color_mode))
+        _check_args(args)
+        if args.ghidra_auto:
+            generated_export = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
+        report = _filtered(args, scan_file(args.target, generated_export or args.ghidra))
+        rendered = _render(args, report)
         if args.output is not None:
-            args.output.write_text(rendered, encoding="utf-8")  # NOSONAR: writes the user-supplied output report path (CLI tool)
+            args.output.resolve().write_text(rendered, encoding="utf-8")
         else:
             sys.stdout.write(rendered)
-    except (OSError, ParseError, ValueError, GhidraError) as exc:
+    except (OSError, ValueError, GhidraError) as exc:
         print("pwnscan: %s" % exc, file=sys.stderr)
         return 2
     finally:

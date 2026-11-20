@@ -45,7 +45,9 @@ def render_text(report: ScanReport, color: bool = False) -> str:
 
 
 def _state(value: object) -> str:
-    return "unknown" if value is None else ("on" if value else "off")
+    if value is None:
+        return "unknown"
+    return "on" if value else "off"
 
 
 def use_color(mode: str) -> bool:

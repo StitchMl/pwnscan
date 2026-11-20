@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import replace
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -11,7 +10,9 @@ from .model import BinaryInfo, Finding, ScanReport
 from .parsers import parse_binary
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": "may use an unbounded %s", "sscanf": "may use an unbounded %s", "fscanf": "may use an unbounded %s", "__isoc99_scanf": "may use an unbounded %s", "__isoc99_sscanf": "may use an unbounded %s", "__isoc99_fscanf": "may use an unbounded %s"}
+UNBOUNDED_FORMAT = "may use an unbounded %s"
+UNKNOWN = "<unknown>"
+UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": UNBOUNDED_FORMAT, "sscanf": UNBOUNDED_FORMAT, "fscanf": UNBOUNDED_FORMAT, "__isoc99_scanf": UNBOUNDED_FORMAT, "__isoc99_sscanf": UNBOUNDED_FORMAT, "__isoc99_fscanf": UNBOUNDED_FORMAT}
 FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "syslog"}
 FORMAT_INDEXES = {
     "printf": 0, "vprintf": 0,
@@ -128,26 +129,30 @@ def _call_position(call: dict) -> tuple[str, int, str]:
     return str(call.get("function") or ""), numeric, value
 
 
+def _record_free(call: dict, function: str, freed: dict, double_free: list) -> None:
+    identity = _argument_identity(_call_argument(call, 0))
+    if identity is None:
+        return
+    key = function, identity
+    previous = freed.get(key)
+    if previous is not None:
+        double_free.append(
+            "%s frees %s at %s after an earlier free at %s"
+            % (function, identity, call.get("from"), previous.get("from"))
+        )
+    else:
+        freed[key] = call
+
+
 def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[str]]:
     double_free: list[str] = []
     use_after_free: list[str] = []
     freed: dict[tuple[str, str], dict] = {}
     for call in sorted(calls, key=_call_position):
-        function = str(call.get("function") or "<unknown>")
+        function = str(call.get("function") or UNKNOWN)
         name = _call_name(call)
         if name in DEALLOCATORS:
-            identity = _argument_identity(_call_argument(call, 0))
-            if identity is None:
-                continue
-            key = function, identity
-            previous = freed.get(key)
-            if previous is not None:
-                double_free.append(
-                    "%s frees %s at %s after an earlier free at %s"
-                    % (function, identity, call.get("from"), previous.get("from"))
-                )
-            else:
-                freed[key] = call
+            _record_free(call, function, freed, double_free)
             continue
         indexes = HEAP_DEREFERENCE_ARGUMENTS.get(name, set())
         for index in indexes:
@@ -229,7 +234,7 @@ def _check_bounded_overflows(bounded: Sequence[dict]) -> Optional[Finding]:
         delta = item["requested"] - item["buffer_size"]
         evidence.append(
             "Ghidra call %s at %s in %s writes up to %d bytes into %s (%d bytes); overflow window %d bytes"
-            % (item["name"], call.get("from"), call.get("function") or "<unknown>", item["requested"], variable, item["buffer_size"], delta)
+            % (item["name"], call.get("from"), call.get("function") or UNKNOWN, item["requested"], variable, item["buffer_size"], delta)
         )
         validation.append("Send exactly %d non-newline bytes to the input reaching %s and confirm saved-state corruption in a debugger." % (item["requested"], call.get("from")))
     return _finding(
@@ -319,7 +324,7 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
             continue
         target = call.get("target") if isinstance(call.get("target"), dict) else {}
         entry = "indirect call at %s in %s; target %s" % (
-            call.get("from"), call.get("function") or "<unknown>",
+            call.get("from"), call.get("function") or UNKNOWN,
             _argument_identity(target) or target.get("repr") or "not recovered",
         )
         (stack_indirect if target.get("kind") == "stack" else other_indirect).append(entry)
@@ -355,7 +360,7 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
     reasons = (
         ["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven]
         + ["unverified string hint: %s" % name for name in hints]
-        + ["Ghidra reference: %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in callsites]
+        + ["Ghidra reference: %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to")) for item in callsites]
     )
     nx = info.mitigations.get("nx")
     canary = info.mitigations.get("stack_canary")
@@ -365,7 +370,12 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
         vector = "Find the overwrite offset, control the return address, then build a ROP/ret2libc chain or jump to a win function."
     else:
         vector = "Trace attacker-controlled lengths to the destination. If a stack canary blocks return-address control, target adjacent data or leak the canary first."
-    level = "high" if callsites and "gets" in proven else ("medium" if proven else "low")
+    if callsites and "gets" in proven:
+        level = "high"
+    elif proven:
+        level = "medium"
+    else:
+        level = "low"
     return _finding(
         "PWN-BOF-001", "Unbounded memory-write surface", level, level, reasons, vector,
         ["Inspect each call site and destination size.", "Generate a cyclic pattern in an isolated challenge runner.", "Confirm control of saved state with a debugger."],
@@ -380,7 +390,7 @@ def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: s
     ]
     if dynamic_format_calls:
         call_evidence = [
-            "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to"))
+            "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to"))
             for item in dynamic_format_calls
         ]
         return _finding(
@@ -410,7 +420,7 @@ def _check_command_sinks(parsed_imports: set[str], ghidra_calls: Sequence[dict])
     if dynamic_command_calls:
         return _finding(
             "PWN-CMD-001", "Dynamic command execution candidate", "high", "high",
-            ["dynamic command at %s in %s -> %s" % (item.get("from"), item.get("function") or "<unknown>", item.get("to")) for item in dynamic_command_calls],
+            ["dynamic command at %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to")) for item in dynamic_command_calls],
             "The decompiler recovered a non-constant command argument. Preserve the known prefix and test a shell separator followed by `cat /flag` only inside the authorized challenge runner.",
             ["Inspect how input reaches the command argument.", "Record quoting, allowlists and the invoked shell before choosing a separator."],
             "Avoid shell command construction. Use fixed executable paths and validated argument arrays.",
@@ -427,6 +437,18 @@ def _check_command_sinks(parsed_imports: set[str], ghidra_calls: Sequence[dict])
     return None
 
 
+def _win_address_note(info: BinaryInfo, win_symbols: Sequence[str], symbol_addresses: dict) -> str:
+    addressed = [(name, symbol_addresses[name]) for name in win_symbols if name in symbol_addresses]
+    if addressed:
+        chosen_name, chosen_address = addressed[0]
+        pack = "p64" if info.bits == 64 else "p32"
+        target = "image-relative offset" if info.mitigations.get("pie") else "virtual address"
+        return "%s %s=0x%x; scaffold: payload = b\"A\" * OFFSET + %s(0x%x)." % (target, chosen_name, chosen_address, pack, chosen_address)
+    if info.mitigations.get("pie"):
+        return "PIE requires a code-pointer leak or relative transfer."
+    return "Resolve the routine address before building ret2win."
+
+
 def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str], symbol_addresses: dict) -> List[Finding]:
     findings: List[Finding] = []
     win_symbols = sorted(name for name in symbols if WIN_NAMES.search(name))
@@ -435,14 +457,7 @@ def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str
     if exact_chain is not None:
         findings.append(exact_chain)
     if win_symbols or win_strings:
-        addressed = [(name, symbol_addresses[name]) for name in win_symbols if name in symbol_addresses]
-        if addressed:
-            chosen_name, chosen_address = addressed[0]
-            pack = "p64" if info.bits == 64 else "p32"
-            target = "image-relative offset" if info.mitigations.get("pie") else "virtual address"
-            address_note = "%s %s=0x%x; scaffold: payload = b\"A\" * OFFSET + %s(0x%x)." % (target, chosen_name, chosen_address, pack, chosen_address)
-        else:
-            address_note = "PIE requires a code-pointer leak or relative transfer." if info.mitigations.get("pie") else "Resolve the routine address before building ret2win."
+        address_note = _win_address_note(info, win_symbols, symbol_addresses)
         findings.append(_finding(
             "PWN-WIN-001", "Hidden success path or flag material", "medium", "high" if win_symbols else "medium",
             ["symbol: %s" % name for name in win_symbols] + ["string: %s" % value for value in win_strings],
@@ -534,35 +549,43 @@ def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
     return ScanReport("pwnscan/v1", target, hashlib.sha256(data).hexdigest(), len(data), info, analyze(info))
 
 
+def _resolve_call_target(call: dict, plt_addresses: dict, ghidra_base: int) -> None:
+    current_to = call.get("to")
+    if current_to and not (isinstance(current_to, str) and current_to.startswith(("DAT_", "LAB_"))):
+        return
+    target = call.get("target")
+    repr_text = target.get("repr") if isinstance(target, dict) else None
+    if not isinstance(repr_text, str):
+        return
+    match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
+    if not match:
+        return
+    addr = int(match.group(1), 16)
+    candidates = [addr]
+    if ghidra_base and addr >= ghidra_base:
+        candidates.append(addr - ghidra_base)
+    for candidate in candidates:
+        addr_key = "0x%x" % candidate
+        if addr_key in plt_addresses:
+            call["to"] = plt_addresses[addr_key]
+            break
+
+
 def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict, ghidra_base: int = 0) -> List[dict]:
     resolved: List[dict] = []
     for item in calls:
         if not isinstance(item, dict):
             continue
         call = dict(item)
-        current_to = call.get("to")
-        unresolved = not current_to or (isinstance(current_to, str) and current_to.startswith(("DAT_", "LAB_")))
-        if unresolved and plt_addresses:
-            target = call.get("target")
-            repr_text = target.get("repr") if isinstance(target, dict) else None
-            if isinstance(repr_text, str):
-                match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
-                if match:
-                    addr = int(match.group(1), 16)
-                    for candidate in (addr, addr - ghidra_base if ghidra_base and addr >= ghidra_base else None):
-                        if candidate is None:
-                            continue
-                        addr_key = "0x%x" % candidate
-                        if addr_key in plt_addresses:
-                            call["to"] = plt_addresses[addr_key]
-                            break
+        if plt_addresses:
+            _resolve_call_target(call, plt_addresses, ghidra_base)
         resolved.append(call)
     return sorted(resolved, key=lambda item: (str(item.get("to", "")), str(item.get("from", ""))))
 
 
 def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     try:
-        payload = json.loads(export_path.read_text(encoding="utf-8"))  # NOSONAR: reads the user-supplied Ghidra export path (CLI tool)
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid Ghidra export: %s" % exc) from exc
     if payload.get("schema") != "pwnscan-ghidra/v1":
@@ -597,16 +620,23 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
         "calls": _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base),
     }
     metadata["parsed_imports"] = sorted(set(metadata.get("parsed_imports", [])) | clean_imports, key=str.lower)
-    return replace(
-        info,
+    return BinaryInfo(
+        format=info.format,
+        bits=info.bits,
+        endian=info.endian,
+        architecture=info.architecture,
+        entrypoint=info.entrypoint,
+        image_base=info.image_base,
         imports=sorted(set(info.imports) | clean_imports, key=str.lower),
         symbols=sorted(set(info.symbols) | function_names, key=lambda value: (value.lower(), value)),
+        strings=info.strings,
+        mitigations=info.mitigations,
         metadata=metadata,
     )
 
 
 def scan_file(path: Path, ghidra_export: Optional[Path] = None) -> ScanReport:
-    data = path.read_bytes()  # NOSONAR: reads the user-supplied target binary (CLI tool)
+    data = path.read_bytes()
     info = parse_binary(data)
     if ghidra_export is not None:
         info = _merge_ghidra(info, ghidra_export)
