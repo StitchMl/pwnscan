@@ -8,6 +8,7 @@ import json
 
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.pcode import PcodeOp
+from ghidra.program.model.symbol import ExternalReference
 from java.io import File
 
 
@@ -16,7 +17,7 @@ def _signed(value, bits):
     return value - (1 << bits) if value & sign else value
 
 
-def _stack_offset(varnode, seen=None):
+def _stack_offset(program, varnode, seen=None):
     if varnode is None:
         return None
     if seen is None:
@@ -33,18 +34,48 @@ def _stack_offset(varnode, seen=None):
         return None
     opcode = operation.getOpcode()
     if opcode in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT):
-        return _stack_offset(operation.getInput(0), seen)
+        return _stack_offset(program, operation.getInput(0), seen)
     if opcode in (PcodeOp.PTRSUB, PcodeOp.PTRADD):
         base = operation.getInput(0)
         offset = operation.getInput(1)
         base_address = base.getAddress() if base is not None else None
-        if offset is not None and offset.isConstant() and base_address is not None and (base_address.isStackAddress() or "RSP" in str(base).upper() or "ESP" in str(base).upper()):
+        base_reg = program.getRegister(base) if base is not None else None
+        stack_reg = program.getCompilerSpec().getStackPointer()
+        stack_base = (base_address is not None and base_address.isStackAddress()) or (
+            base_reg is not None and stack_reg is not None and base_reg == stack_reg
+        )
+        if offset is not None and offset.isConstant() and stack_base:
             return _signed(offset.getOffset(), offset.getSize() * 8)
-        return _stack_offset(base, seen)
+        return _stack_offset(program, base, seen)
     if opcode == PcodeOp.MULTIEQUAL:
-        values = set(_stack_offset(operation.getInput(i), set(seen)) for i in range(operation.getNumInputs()))
+        values = set(_stack_offset(program, operation.getInput(i), set(seen)) for i in range(operation.getNumInputs()))
         values.discard(None)
         return values.pop() if len(values) == 1 else None
+    return None
+
+
+def _constant_address_value(varnode, seen=None):
+    if varnode is None:
+        return None
+    if seen is None:
+        seen = set()
+    key = str(varnode)
+    if key in seen:
+        return None
+    seen.add(key)
+    if varnode.isConstant():
+        return varnode.getOffset()
+    operation = varnode.getDef()
+    if operation is None:
+        return None
+    opcode = operation.getOpcode()
+    if opcode in (PcodeOp.COPY, PcodeOp.CAST):
+        return _constant_address_value(operation.getInput(0), seen)
+    if opcode == PcodeOp.PTRSUB and operation.getNumInputs() >= 2:
+        base = operation.getInput(0)
+        offset = operation.getInput(1)
+        if base is not None and base.isConstant() and base.getOffset() == 0 and offset is not None and offset.isConstant():
+            return offset.getOffset()
     return None
 
 
@@ -75,17 +106,17 @@ def _expression(varnode, depth=0, seen=None):
 
 def _argument(program, function, varnode):
     item = {"kind": "dynamic", "repr": str(varnode), "size": varnode.getSize()}
-    if varnode.isConstant():
-        value = varnode.getOffset()
-        item.update({"kind": "constant", "value": value})
+    const_value = _constant_address_value(varnode)
+    if const_value is not None:
+        item.update({"kind": "constant", "value": const_value})
         try:
-            address = program.getAddressFactory().getDefaultAddressSpace().getAddress(value)
+            address = program.getAddressFactory().getDefaultAddressSpace().getAddress(const_value)
             block = program.getMemory().getBlock(address)
             if block is not None:
                 item.update({"kind": "address_constant", "address": str(address), "block": block.getName(), "writable": bool(block.isWrite()), "executable": bool(block.isExecute())})
         except Exception:
             pass
-    offset = _stack_offset(varnode)
+    offset = _stack_offset(program, varnode)
     if offset is not None:
         item.update({"kind": "stack", "stack_offset": offset})
         try:
@@ -110,18 +141,40 @@ def _argument(program, function, varnode):
     return item
 
 
+def _resolve_address_name(program, address):
+    if address is None:
+        return None
+    function = program.getFunctionManager().getFunctionAt(address)
+    if function is None:
+        function = program.getFunctionManager().getFunctionContaining(address)
+    if function is not None:
+        return function.getName()
+    symbol = program.getSymbolTable().getPrimarySymbol(address)
+    return symbol.getName() if symbol is not None else None
+
+
 def _target_name(program, operation):
     target = operation.getInput(0)
-    if target is None:
-        return None
-    address = target.getAddress()
-    if target.isConstant():
-        try:
-            address = program.getAddressFactory().getDefaultAddressSpace().getAddress(target.getOffset())
-        except Exception:
-            return None
-    function = program.getFunctionManager().getFunctionAt(address)
-    return function.getName() if function is not None else None
+    if target is not None:
+        address = target.getAddress()
+        if target.isConstant():
+            try:
+                address = program.getAddressFactory().getDefaultAddressSpace().getAddress(target.getOffset())
+            except Exception:
+                address = None
+        resolved = _resolve_address_name(program, address)
+        if resolved is not None:
+            return resolved
+    call_site = operation.getSeqnum().getTarget()
+    for ref in program.getReferenceManager().getReferencesFrom(call_site):
+        if not ref.getReferenceType().isCall():
+            continue
+        if isinstance(ref, ExternalReference):
+            return ref.getExternalLocation().getLabel()
+        resolved = _resolve_address_name(program, ref.getToAddress())
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _decompiled_calls(program, monitor):
@@ -173,13 +226,16 @@ def collect(program, monitor):
     }
 
 
-arguments = getScriptArgs()
-output = File(arguments[0]) if arguments else askFile("Save pwnscan Ghidra export", "Save")
-payload = collect(currentProgram, monitor)
-handle = open(output.getAbsolutePath(), "w")
-try:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-finally:
-    handle.close()
-print("pwnscan metadata: " + output.getAbsolutePath())
+if currentProgram is None:
+    printerr("No program open in CodeBrowser.")
+else:
+    arguments = getScriptArgs()
+    output = File(arguments[0]) if arguments else askFile("Save pwnscan Ghidra export", "Save")
+    payload = collect(currentProgram, monitor)
+    handle = open(output.getAbsolutePath(), "w")
+    try:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    finally:
+        handle.close()
+    print("pwnscan metadata: " + output.getAbsolutePath())

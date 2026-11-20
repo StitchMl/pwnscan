@@ -308,3 +308,98 @@ def test_elf_fortify_source_detection():
     info = parse_binary(bytes(data))
     assert info.mitigations["fortify"] is True
     assert info.metadata["fortified_imports"] == ["__memcpy_chk", "__printf_chk"]
+
+
+def test_elf32_big_endian_mips_program_headers_and_symbols():
+    data = bytearray(0x400)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x01\x02"  # 32-bit, big-endian
+    data[6] = 1
+    # e_type=3 (ET_DYN), e_machine=8 (mips), entry=0x1000, phoff=0x34, shoff=0x240, phentsize=32, phnum=4, shentsize=40, shnum=4, shstrndx=3
+    struct.pack_into(">HHIIIIIHHHHHH", data, 16, 3, 8, 1, 0x1000, 0x34, 0x240, 0, 52, 32, 4, 40, 4, 3)
+    # Phdr 0: PT_GNU_STACK (p_flags=7 -> NX=False)
+    struct.pack_into(">IIIIIIII", data, 0x34, 0x6474E551, 0, 0, 0, 0, 0, 7, 4)
+    # Phdr 1: PT_GNU_RELRO
+    struct.pack_into(">IIIIIIII", data, 0x54, 0x6474E552, 0, 0, 0, 0, 0, 4, 4)
+    # Phdr 2: PT_INTERP
+    struct.pack_into(">IIIIIIII", data, 0x74, 3, 0, 0, 0, 0, 0, 4, 4)
+    # Phdr 3: PT_DYNAMIC at 0x100 size 16 -> DT_BIND_NOW (tag=24)
+    struct.pack_into(">IIIIIIII", data, 0x94, 2, 0x100, 0x100, 0x100, 16, 16, 6, 4)
+    struct.pack_into(">II", data, 0x100, 24, 0)
+    struct.pack_into(">II", data, 0x108, 0, 0)
+
+    # .strtab at 0x120, .symtab at 0x140 (Elf32_Sym: 16 bytes)
+    data[0x120:0x12c] = b"\0win\0strcpy\0"
+    struct.pack_into(">IIIBBH", data, 0x150, 1, 0x1080, 16, 0x12, 0, 1)
+    struct.pack_into(">IIIBBH", data, 0x160, 5, 0, 0, 0x12, 0, 0)
+    names = b"\0.strtab\0.symtab\0.shstrtab\0"
+    data[0x190:0x190 + len(names)] = names
+    # Shdr 0 (null), 1 (.strtab), 2 (.symtab), 3 (.shstrtab)
+    struct.pack_into(">IIIIIIIIII", data, 0x268, 1, 3, 0, 0, 0x120, 12, 0, 0, 1, 0)
+    struct.pack_into(">IIIIIIIIII", data, 0x290, 9, 2, 0, 0, 0x140, 48, 1, 1, 4, 16)
+    struct.pack_into(">IIIIIIIIII", data, 0x2B8, 17, 3, 0, 0, 0x190, len(names), 0, 0, 1, 0)
+
+    info = parse_binary(bytes(data))
+    assert info.bits == 32
+    assert info.endian == "big"
+    assert info.architecture == "mips"
+    assert info.mitigations["nx"] is False
+    assert info.mitigations["pie"] is True
+    assert info.metadata["relro"] == "full"
+    assert info.metadata["parsed_imports"] == ["strcpy"]
+    assert info.metadata["symbol_addresses"] == {"win": 0x1080}
+
+
+def test_elf32_x86_plt_and_gadgets():
+    data = bytearray(0x400)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x01\x01"  # 32-bit, little-endian
+    data[6] = 1
+    struct.pack_into("<HHIIIIIHHHHHH", data, 16, 2, 3, 1, 0x8048400, 0, 0x200, 0, 52, 0, 0, 40, 6, 5)
+    data[0x100:0x108] = b"\0gets\0\0\0"
+    data[0x110:0x114] = b"\xc9\xc3\x90\xc3"  # leave_ret at +0, ret at +1/+3
+    struct.pack_into("<IIIBBH", data, 0x130, 1, 0, 0, 0x12, 0, 0)
+    struct.pack_into("<II", data, 0x150, 0x804a00c, 1 << 8)  # Elf32_Rel -> sym 1
+    names = b"\0.dynstr\0.dynsym\0.rel.plt\0.plt\0.shstrtab\0"
+    data[0x170:0x170 + len(names)] = names
+    struct.pack_into("<IIIIIIIIII", data, 0x228, 1, 3, 2, 0, 0x100, 8, 0, 0, 1, 0)
+    struct.pack_into("<IIIIIIIIII", data, 0x250, 9, 11, 2, 0, 0x120, 32, 1, 1, 4, 16)
+    struct.pack_into("<IIIIIIIIII", data, 0x278, 17, 9, 2, 0, 0x150, 8, 2, 0, 4, 8)
+    struct.pack_into("<IIIIIIIIII", data, 0x2A0, 26, 1, 6, 0x8048300, 0x110, 32, 0, 0, 16, 16)
+    struct.pack_into("<IIIIIIIIII", data, 0x2C8, 31, 3, 0, 0, 0x170, len(names), 0, 0, 1, 0)
+
+    info = parse_binary(bytes(data))
+    assert info.bits == 32
+    assert info.architecture == "x86"
+    assert info.metadata["plt_addresses"] == {"0x8048310": "gets"}
+    assert info.metadata["gadgets"]["leave_ret"] == [0x8048300]
+
+
+def test_pe32_imports_cfg_and_rwx_section():
+    data = bytearray(0x400)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x14C, 1, 0, 0, 0, 0xE0, 0x102)
+    opt = 0x98
+    struct.pack_into("<H", data, opt, 0x10B)  # PE32
+    struct.pack_into("<I", data, opt + 16, 0x1000)
+    struct.pack_into("<I", data, opt + 28, 0x400000)
+    struct.pack_into("<H", data, opt + 70, 0x4140)  # NX + ASLR + CFG
+    struct.pack_into("<II", data, opt + 104, 0x2000, 0x40)  # Import directory at opt+96+8
+    sec = opt + 0xE0
+    data[sec:sec + 8] = b".rwx\0\0\0\0"
+    struct.pack_into("<IIIIII", data, sec + 8, 0x200, 0x2000, 0x200, 0x200, 0, 0)
+    struct.pack_into("<I", data, sec + 36, 0xE0000020)  # RWX section
+    struct.pack_into("<IIIII", data, 0x200, 0x2020, 0, 0, 0x2040, 0)
+    struct.pack_into("<II", data, 0x220, 0x2030, 0)
+    data[0x230:0x239] = b"\0\0strcpy\0"
+
+    info = parse_binary(bytes(data))
+    assert info.bits == 32
+    assert info.architecture == "x86"
+    assert info.entrypoint == 0x401000
+    assert info.mitigations["cfg"] is True
+    assert info.mitigations["writable_executable"] is True
+    assert info.metadata["rwx_sections"] == [".rwx"]
+    assert info.metadata["parsed_imports"] == ["strcpy"]
