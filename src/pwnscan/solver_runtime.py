@@ -11,6 +11,9 @@ import select
 import subprocess
 import time
 
+TARGET = globals().get("TARGET", "")
+TOKEN_LENGTH = globals().get("TOKEN_LENGTH", 0)
+
 
 def read_quiet(stream, idle=0.20, overall=2.0, limit=131072):
     """Read nonblocking Linux pipes until output settles or deadline expires."""
