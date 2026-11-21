@@ -17,6 +17,7 @@ dev = ["pytest>=7"]
 
 [project.scripts]
 pwnscan = "pwnscan.cli:main"
+pwnscan-batch = "pwnscan.batch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
