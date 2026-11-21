@@ -129,7 +129,9 @@ def main(argv=None) -> int:
             print("Static findings:", file=sys.stderr)
             for finding in report.findings:
                 print("  %s [%s/%s]: %s" % (
-                    finding.id, finding.severity, finding.confidence, finding.title
+                    finding.id, getattr(finding, "severity", "unknown"),
+                    getattr(finding, "confidence", "unknown"),
+                    getattr(finding, "title", "unspecified")
                 ), file=sys.stderr)
             print("Available strategies: format-token (confirmed dynamic format + "
                   "token length), ret2win (verified byte-exact payload).", file=sys.stderr)
