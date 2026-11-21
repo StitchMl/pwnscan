@@ -35,7 +35,7 @@ def test_solver_rejects_unsupported_without_generating(tmp_path, monkeypatch):
 
     report = SimpleNamespace(findings=[], binary=SimpleNamespace(strings=[]))
 
-    monkeypatch.setattr(solve, "scan_file", lambda path, export=None: Report())
+    monkeypatch.setattr(solve, "scan_file", lambda path, export=None: report)
     assert solve.main([str(binary), "--no-ghidra"]) == 2
     assert not binary.with_name(binary.name + ".solve.py").exists()
 
@@ -47,9 +47,12 @@ def test_solver_removes_ghidra_temp_export(tmp_path, monkeypatch):
     export.write_text("{}")
     monkeypatch.setattr(solve, "export_headless", lambda *a, **kw: export)
 
-    class Report:
-        findings = [SimpleNamespace(id="PWN-FMT-001", confidence="high", evidence=["dynamic format argument at 0010234 in main -> printf"])]
-        binary = SimpleNamespace(strings=["15-character uppercase secret password"], mitigations={"pie": True, "stack_canary": True}, format="ELF")
+    report = SimpleNamespace(
+        findings=[SimpleNamespace(id="PWN-FMT-001", confidence="high",
+                                  evidence=["dynamic format argument at 0010234 in main -> printf"])],
+        binary=SimpleNamespace(strings=["15-character uppercase secret password"],
+                               mitigations={"pie": True, "stack_canary": True}, format="ELF"),
+    )
 
     monkeypatch.setattr(solve, "scan_file", lambda path, metadata=None: report)
     assert solve.main([str(binary)]) == 0
