@@ -529,3 +529,29 @@ def test_fwrite_after_free_is_reported_as_uaf():
         {"from": "00402004", "function": "challenge", "to": "fwrite", "arguments": [pointer, {"kind": "constant", "value": 1}, {"kind": "constant", "value": 16}, dynamic("fp")]},
     ]}}))
     assert any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_pcode_unique_temporary_reuse_is_not_pointer_identity():
+    """Distinct free arguments can occupy the same Ghidra unique varnode."""
+    argument = {"kind": "dynamic", "repr": "(unique, 0x23e00, 8)",
+                "high_name": "UNNAMED"}
+    calls = [
+        {"from": "00101f71", "function": "challenge", "to": "free",
+         "arguments": [argument]},
+        {"from": "00101fdf", "function": "challenge", "to": "free",
+         "arguments": [argument]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    assert not any(item.id == "PWN-HEAP-001" for item in findings)
+
+
+def test_named_pointer_repeated_free_stays_unproven_candidate():
+    pointer = {"kind": "dynamic", "high_name": "entry", "repr": "(unique, 0x1234, 8)"}
+    calls = [
+        {"from": "00401010", "function": "edit", "to": "free", "arguments": [pointer]},
+        {"from": "00401030", "function": "edit", "to": "free", "arguments": [pointer]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    candidate = next(item for item in findings if item.id == "PWN-HEAP-001")
+    assert candidate.confidence == "low"
+    assert candidate.exploit_status == "validation-only"
