@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from .analyzer import scan_file
-from .ghidra import export_headless, GhidraError
+from .ghidra import GhidraError, export_headless
 
 
 def inferred_length(strings) -> int | None:
