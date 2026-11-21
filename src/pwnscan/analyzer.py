@@ -133,15 +133,19 @@ def _expression_has_dynamic_input(argument: dict) -> bool:
 
 
 def _argument_identity(argument: dict) -> str | None:
+    """Return a *candidate* semantic identity, never a P-code temporary name.
+
+    Ghidra unique/register varnodes are transient storage and may be reused
+    for unrelated pointers across different calls. Only named high variables
+    or explicit stack locations can support a lifetime candidate. Identity
+    alone does not prove a feasible CFG path or absence of reassignment.
+    """
     high_name = argument.get("high_name")
     if isinstance(high_name, str) and high_name and high_name not in {"UNNAMED", "null"}:
         return "high:%s" % high_name
     stack_offset = argument.get("stack_offset")
-    if isinstance(stack_offset, int):
+    if isinstance(stack_offset, int) and argument.get("kind") == "stack":
         return "stack:%d" % stack_offset
-    representation = argument.get("repr")
-    if isinstance(representation, str) and representation and argument.get("kind") != "constant":
-        return "repr:%s" % representation
     return None
 
 
@@ -340,14 +344,14 @@ def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
     double_free, use_after_free = _heap_lifetime_candidates(ghidra_calls)
     if double_free:
         findings.append(_finding(
-            "PWN-HEAP-001", "Repeated free of the same recovered pointer", "high", "medium", double_free,
+            "PWN-HEAP-001", "Repeated free of a candidate pointer identity", "medium", "low", double_free,
             "Reach both reported frees on one execution path. If confirmed, use allocator diagnostics to test duplicate-bin insertion; derive a write target only for the challenge allocator and version.",
             ["Confirm both frees execute without an intervening reassignment.", "Record allocator family and hardening before selecting a heap technique."],
             "Give each allocation one owner and clear or transfer the pointer after free.",
         ))
     if use_after_free:
         findings.append(_finding(
-            "PWN-HEAP-002", "Freed pointer reused by a memory operation", "high", "medium", use_after_free,
+            "PWN-HEAP-002", "Potential freed-pointer reuse", "medium", "low", use_after_free,
             "Reach the free and later dereference on one path, reclaim the same size class with controlled data, then test whether the reported operation reads or overwrites the replacement object.",
             ["Confirm no reassignment dominates the later use.", "Use allocator tracing to prove the chunk was reclaimed."],
             "Invalidate aliases after free and enforce object lifetime through single ownership.",
