@@ -16,8 +16,8 @@ from .analyzer import scan_file
 from .ghidra import GhidraError, export_headless
 
 
-MAGICS = (b"\\x7fELF", b"MZ", b"\\xfe\\xed\\xfa\\xce", b"\\xce\\xfa\\xed\\xfe",
-          b"\\xfe\\xed\\xfa\\xcf", b"\\xcf\\xfa\\xed\\xfe")
+MAGICS = (b"\x7fELF", b"MZ", b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+          b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe")
 
 
 def is_candidate(path: Path) -> bool:
@@ -82,7 +82,7 @@ def main(argv=None) -> int:
         try:
             digest = hashlib.sha256(target.read_bytes()).hexdigest()
             # Include the digest to prevent collisions between equal basenames.
-            prefix = target.name.replace("/", "_").replace("\\\\", "_") + "-" + digest[:16]
+            prefix = target.name.replace("/", "_").replace("\\", "_") + "-" + digest[:16]
             if args.ghidra_auto:
                 export = export_headless(
                     target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout
@@ -90,7 +90,7 @@ def main(argv=None) -> int:
             report = scan_file(target, export)
             report_file = output_dir / (prefix + ".json")
             report_file.write_text(
-                json.dumps(report.as_dict(), sort_keys=True, indent=2) + "\\n",
+                json.dumps(report.as_dict(), sort_keys=True, indent=2) + "\n",
                 encoding="utf-8",
             )
             entry.update(status="ok", sha256=digest, report=str(report_file),
@@ -109,7 +109,7 @@ def main(argv=None) -> int:
         print("%s %s" % (entry["status"].upper(), target), file=sys.stderr)
 
     (output_dir / "index.json").write_text(
-        json.dumps(index, sort_keys=True, indent=2) + "\\n", encoding="utf-8"
+        json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     print("Reports: %s" % (output_dir / "index.json"))
     return 2 if failures else 0
