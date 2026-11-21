@@ -125,8 +125,17 @@ def main(argv=None) -> int:
                 parser.error("--token-length must be between 1 and 128")
             definitions = "TOKEN_LENGTH = " + repr(length) + "\n"
         else:
-            print("No supported proven strategy. A format finding alone does not prove exploitability.",
-                  file=sys.stderr)
+            print("No supported proven exploit strategy; no script generated.", file=sys.stderr)
+            print("Static findings:", file=sys.stderr)
+            for finding in report.findings:
+                print("  %s [%s/%s]: %s" % (
+                    finding.id, finding.severity, finding.confidence, finding.title
+                ), file=sys.stderr)
+            print("Available strategies: format-token (confirmed dynamic format + "
+                  "token length), ret2win (verified byte-exact payload).", file=sys.stderr)
+            print("Heap, index-bound, multithreaded and network protocols require "
+                  "additional data-flow and runtime validation; current solver "
+                  "does not claim to exploit them.", file=sys.stderr)
             return 2
         runtime = Path(__file__).with_name(runtime_name).read_text(encoding="utf-8")
         output = (args.output or args.target.with_name(args.target.name + ".solve.py")).resolve()
