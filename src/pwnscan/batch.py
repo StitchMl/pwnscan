@@ -15,7 +15,6 @@ from pathlib import Path
 from .analyzer import scan_file
 from .ghidra import GhidraError, export_headless
 
-
 MAGICS = (b"\x7fELF", b"MZ", b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
           b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe")
 
