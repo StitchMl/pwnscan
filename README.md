@@ -122,3 +122,29 @@ binaries.
 Use this tool for CTF challenges, labs, and systems you may test. `pwnscan`
 does not connect to targets or execute target code. Generated scaffolds contain
 only addresses derived from the supplied artifact and require manual validation.
+
+## Batch analysis of arbitrary CTF binaries
+
+Install Ghidra separately and set `GHIDRA_HOME` to its extracted installation
+root (containing `support/analyzeHeadless`). The batch entry point accepts
+individual files and directories. It detects ELF, PE, and thin Mach-O candidates
+by magic bytes, not file extension or challenge name. Binaries are **never
+executed**.
+
+```console
+pwnscan-batch ./challenges --recursive --ghidra-auto --output-dir ./reports
+pwnscan-batch ./challenge1 ./challenge2 --ghidra-auto --keep-ghidra-export
+```
+
+Reports are saved as separate JSON files with SHA-256-derived suffixes to avoid
+basename collisions, plus an `index.json` listing successes and failures.
+An unsupported or failed target does not abort the remaining batch; the command
+returns exit code 2 if any target failed. Default execution without
+`--ghidra-auto` performs fast static triage. Use `--ghidra-timeout 600` for
+large binaries, and `--ghidra-home /path/to/ghidra` to select a specific Ghidra
+install. Ghidra headless analysis is CPU/memory intensive and processes files
+sequentially to keep resource usage bounded.
+
+When installed from a source checkout with `pip install -e .`, the bundled
+Java exporter is discovered automatically. The batch command also supports
+`--ghidra-script /path/to/PwnscanExport.java` when using a custom exporter.
