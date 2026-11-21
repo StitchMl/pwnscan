@@ -20,14 +20,16 @@ def _headless_executable(home: Optional[Path] = None) -> Path:
     configured = os.environ.get("GHIDRA_HOME")
     if configured:
         candidates.append(Path(configured))
-    located = shutil.which("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
-    if located:
-        return Path(located)
     name = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
+    # An explicit home takes precedence over PATH, avoiding accidental use of
+    # a different Ghidra installation on multi-version workstations.
     for candidate in candidates:
         executable = candidate / "support" / name
         if executable.is_file():
             return executable
+    located = shutil.which(name)
+    if located:
+        return Path(located)
     raise GhidraError("Ghidra headless not found; use --ghidra-home or GHIDRA_HOME")
 
 
