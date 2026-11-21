@@ -152,8 +152,10 @@ Java exporter is discovered automatically. The batch command also supports
 ## Experimental exploit solver (explicit opt-in)
 
 The static scanner does not recover runtime secrets or flags. The `pwnscan-solve`
-command is an experimental solver for Ghidra-evidenced dynamic format-string
-calls and uppercase secrets of known or inferred length. Unsupported binaries
+command is an experimental strategy selector for (a) Ghidra-evidenced dynamic
+format-string calls with uppercase secrets of known or inferred length, and
+(b) statically proven direct ret2win payloads with known offsets, fixed code
+addresses, and disabled PIE/ASLR and stack canaries. Unsupported binaries
 return a diagnostic instead of a fabricated flag. It is not a universal solver.
 
 On Windows, Ghidra runs automatically first and a standalone Linux script is
@@ -166,7 +168,11 @@ pwnscan-solve "C:\Users\Matteo\Downloads\babyfmt_level1.0" `
   --output "$HOME\Desktop\babyfmt_level1.solve.py"
 ```
 
-On Linux use: `pwnscan-solve ./challenge --execute`.
+On Linux use: `pwnscan-solve ./challenge --execute`. Choose a strategy with
+`--strategy format-token` or `--strategy ret2win`; the default `auto`
+prefers a complete ret2win chain. On Windows, `--execute --wsl` requires
+an installed Linux distribution and Python 3 inside WSL. Generated code is
+saved without running it unless `--execute` is explicitly specified.
 
 The generated solver probes positional `%N$s` reads in separate processes and
 submits any candidate in the same process (secrets can change across launches).
@@ -174,3 +180,9 @@ It prints a candidate only when success text is observed. A local password may
 unlock a subsequent `/flag` read, but is not necessarily itself the CTF flag.
 Executing an untrusted challenge is opt-in and should be done only in an isolated
 authorized environment. The normal static scanner never executes the target.
+
+A direct ret2win runner submits the exact payload recovered from the existing
+`PWN-FLAG-CHAIN-001` finding. It reports `flag-pattern-observed` only when
+recognizable flag-shaped text appears in stdout; a successful function return
+without observable output is not proof that the flag was recovered. The
+format-token runner reports password acceptance, not a recovered flag.
