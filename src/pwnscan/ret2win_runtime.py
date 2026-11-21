@@ -8,6 +8,9 @@ import os
 import re
 import subprocess
 
+TARGET = globals().get("TARGET", "")
+PAYLOAD_HEX = globals().get("PAYLOAD_HEX", "")
+
 
 def run(binary, payload, timeout):
     """Submit exact payload to a local process and capture bounded output."""
@@ -21,7 +24,7 @@ def run(binary, payload, timeout):
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, _ = proc.communicate()
-        raise RuntimeError("target timed out; output:\n" + stdout[:8192].decode("utf-8", "replace"))
+        raise RuntimeError("target timed out; output:\n" + stdout[:8192].decode("utf-8", "replace")) from None
     return proc.returncode, stdout[:131072]
 
 
