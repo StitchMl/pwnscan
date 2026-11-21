@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from .analyzer import scan_file
+from .ghidra import export_headless, GhidraError
 
 
 def inferred_length(strings) -> int | None:
@@ -52,6 +53,9 @@ def main(argv=None) -> int:
     parser.add_argument("--token-length", type=int,
                         help="known length of an uppercase token, when not in strings")
     parser.add_argument("--max-position", type=int, default=48)
+    parser.add_argument("--ghidra-home", type=Path)
+    parser.add_argument("--ghidra-timeout", type=int, default=300)
+    parser.add_argument("--no-ghidra", action="store_true", help="disable automatic Ghidra enrichment")
     args = parser.parse_args(argv)
     if args.wsl and not args.execute:
         parser.error("--wsl requires --execute")
@@ -60,7 +64,15 @@ def main(argv=None) -> int:
     if not args.target.is_file():
         parser.error("target is not a file: %s" % args.target)
     try:
-        report = scan_file(args.target)
+        # Use Ghidra evidence when available; report unsupported cases explicitly.
+        export = None
+        try:
+            if not args.no_ghidra:
+                export = export_headless(args.target, args.ghidra_home, timeout=args.ghidra_timeout)
+            report = scan_file(args.target, export)
+        finally:
+            if export is not None:
+                export.unlink(missing_ok=True)
         finding_ids = {item.id for item in report.findings}
         if "PWN-FMT-001" not in finding_ids:
             print("No supported format-string exploit candidate in static findings.", file=sys.stderr)
@@ -95,7 +107,7 @@ def main(argv=None) -> int:
             command = [sys.executable, str(output), str(args.target.resolve()),
                        "--max-position", str(args.max_position)]
         return subprocess.run(command, check=False).returncode
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, GhidraError) as exc:
         print("pwnscan-solve: %s" % exc, file=sys.stderr)
         return 2
 
