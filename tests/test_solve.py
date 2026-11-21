@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 from pwnscan import solve
@@ -15,11 +14,12 @@ def test_solver_generates_standalone_script(tmp_path, monkeypatch):
     binary = tmp_path / "arbitrary-ctf-file"
     binary.write_bytes(b"\x7fELFfake")
 
-    class Report:
-        findings = [SimpleNamespace(id="PWN-FMT-001", confidence="high", evidence=["dynamic format argument at 0010234 in main -> printf"])]
-        binary = SimpleNamespace(strings=["15-character uppercase secret password"], mitigations={"pie": True, "stack_canary": True}, format="ELF")
+    report = SimpleNamespace(
+        findings=[SimpleNamespace(id="PWN-FMT-001", confidence="high", evidence=["dynamic format argument at 0010234 in main -> printf"])],
+        binary=SimpleNamespace(strings=["15-character uppercase secret password"], mitigations={"pie": True, "stack_canary": True}, format="ELF"),
+    )
 
-    monkeypatch.setattr(solve, "scan_file", lambda path, export=None: Report())
+    monkeypatch.setattr(solve, "scan_file", lambda path, export=None: report)
     result = solve.main([str(binary), "--no-ghidra"])
     assert result == 0
     script = binary.with_name(binary.name + ".solve.py")
@@ -33,9 +33,7 @@ def test_solver_rejects_unsupported_without_generating(tmp_path, monkeypatch):
     binary = tmp_path / "arbitrary-ctf-file"
     binary.write_bytes(b"\x7fELFfake")
 
-    class Report:
-        findings = []
-        binary = SimpleNamespace(strings=[])
+    report = SimpleNamespace(findings=[], binary=SimpleNamespace(strings=[]))
 
     monkeypatch.setattr(solve, "scan_file", lambda path, export=None: Report())
     assert solve.main([str(binary), "--no-ghidra"]) == 2
@@ -53,7 +51,7 @@ def test_solver_removes_ghidra_temp_export(tmp_path, monkeypatch):
         findings = [SimpleNamespace(id="PWN-FMT-001", confidence="high", evidence=["dynamic format argument at 0010234 in main -> printf"])]
         binary = SimpleNamespace(strings=["15-character uppercase secret password"], mitigations={"pie": True, "stack_canary": True}, format="ELF")
 
-    monkeypatch.setattr(solve, "scan_file", lambda path, metadata=None: Report())
+    monkeypatch.setattr(solve, "scan_file", lambda path, metadata=None: report)
     assert solve.main([str(binary)]) == 0
     assert not export.exists()
 
