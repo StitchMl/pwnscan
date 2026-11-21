@@ -148,3 +148,29 @@ sequentially to keep resource usage bounded.
 When installed from a source checkout with `pip install -e .`, the bundled
 Java exporter is discovered automatically. The batch command also supports
 `--ghidra-script /path/to/PwnscanExport.java` when using a custom exporter.
+
+## Experimental exploit solver (explicit opt-in)
+
+The static scanner does not recover runtime secrets or flags. The `pwnscan-solve`
+command is an experimental solver for Ghidra-evidenced dynamic format-string
+calls and uppercase secrets of known or inferred length. Unsupported binaries
+return a diagnostic instead of a fabricated flag. It is not a universal solver.
+
+On Windows, Ghidra runs automatically first and a standalone Linux script is
+generated. With `--execute --wsl`, the script runs inside WSL:
+
+```powershell
+pwnscan-solve "C:\Users\Matteo\Downloads\babyfmt_level1.0" `
+  --ghidra-home "C:\Tools\ghidra_12.0_PUBLIC" `
+  --execute --wsl `
+  --output "$HOME\Desktop\babyfmt_level1.solve.py"
+```
+
+On Linux use: `pwnscan-solve ./challenge --execute`.
+
+The generated solver probes positional `%N$s` reads in separate processes and
+submits any candidate in the same process (secrets can change across launches).
+It prints a candidate only when success text is observed. A local password may
+unlock a subsequent `/flag` read, but is not necessarily itself the CTF flag.
+Executing an untrusted challenge is opt-in and should be done only in an isolated
+authorized environment. The normal static scanner never executes the target.
