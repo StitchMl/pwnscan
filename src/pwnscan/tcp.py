@@ -13,7 +13,6 @@ import socket
 import sys
 from pathlib import Path
 
-
 MAX_TRANSCRIPT = 131072
 MAX_STEPS = 64
 MAX_SEND = 4096
