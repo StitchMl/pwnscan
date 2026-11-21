@@ -186,3 +186,48 @@ A direct ret2win runner submits the exact payload recovered from the existing
 recognizable flag-shaped text appears in stdout; a successful function return
 without observable output is not proof that the flag was recovered. The
 format-token runner reports password acceptance, not a recovered flag.
+
+## TCP challenge protocol harness
+
+`pwnscan-tcp` validates and replays bounded TCP protocol transcripts in an
+authorized environment. This is **not** a generic heap solver: protocol steps
+must be supplied as JSON, and receiving a flag-like string is only evidence
+that the remote process printed that string.
+
+Example `steps.json`:
+
+```json
+[
+  {"recv_until": "Choice:"},
+  {"send": "1\n"},
+  {"recv_until": "Index:"},
+  {"send": "0\n"}
+]
+```
+
+Dry validation (does not connect):
+
+```powershell
+pwnscan-tcp "$HOME\Desktop\steps.json"
+```
+
+Replay against a **local challenge you started yourself**:
+
+```powershell
+pwnscan-tcp "$HOME\Desktop\steps.json" --host 127.0.0.1 --port 1337 --execute
+```
+
+Supported actions are `send`, `send_hex`, and `recv_until`. Each
+operation is bounded, and connection requires an explicit `--execute`.
+This harness does not derive heap allocator states, discover menus or bypass
+PIE/ASLR automatically.
+
+## Heap lifetime evidence quality
+
+The earlier `PWN-HEAP-001` heuristic falsely matched different `free`
+calls when their Ghidra arguments reused a temporary P-code `unique`
+varnode (for example, `(unique, 0x23e00, 8)`). Such varnode reuse is
+**not** pointer identity, so the analyzer now requires a named high variable
+or explicit stack offset for a candidate. Findings remain low-confidence
+validation-only, because the scanner still lacks complete CFG feasibility,
+pointer alias/reassignment tracking and allocator-state reasoning.
