@@ -403,3 +403,19 @@ def test_pe32_imports_cfg_and_rwx_section():
     assert info.mitigations["writable_executable"] is True
     assert info.metadata["rwx_sections"] == [".rwx"]
     assert info.metadata["parsed_imports"] == ["strcpy"]
+
+
+def test_elf_stripped_canary_unknown_unless_symbol_string_present():
+    # No section headers -> no symtab: absence of the symbol must not claim "off".
+    assert parse_binary(minimal_elf64()).mitigations["stack_canary"] is None
+    assert parse_binary(minimal_elf64(b"__stack_chk_fail\0")).mitigations["stack_canary"] is True
+
+
+def test_macho_stripped_canary_unknown_unless_symbol_string_present():
+    header = bytearray(32)
+    struct.pack_into("<IIIIIIII", header, 0, 0xFEEDFACF, 0x01000007, 3, 0, 0, 0, 0, 0)
+    assert parse_binary(bytes(header)).mitigations["stack_canary"] is None
+    with_string = bytearray(32 + 20)
+    struct.pack_into("<IIIIIIII", with_string, 0, 0xFEEDFACF, 0x01000007, 3, 0, 0, 0, 0, 0)
+    with_string[32:32 + 18] = b"___stack_chk_fail\0"
+    assert parse_binary(bytes(with_string)).mitigations["stack_canary"] is True

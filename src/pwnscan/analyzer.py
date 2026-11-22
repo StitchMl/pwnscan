@@ -75,12 +75,42 @@ OUTPUT_STRING_NAMES = {"puts", "printf", "fputs", "write", "fprintf", "dprintf",
 GUARD_TEXT = re.compile(r"cannot|invalid|freed|denied|forbidden|not allowed|error|failed", re.I)
 
 
+def _strip_underscores(name: str) -> str:
+    return name.lstrip("_")
+
+
+def _expand_name_table(table: dict) -> None:
+    """Index every lookup key also in its underscore-stripped form.
+
+    Ghidra/ELF names arrive as ``__isoc99_scanf``, ``__read_chk``, ``_printf``
+    while the rule tables use the bare form; matching goes through
+    ``_call_name`` (stripped), so the tables must contain the stripped keys.
+    """
+
+    for key in list(table):
+        table.setdefault(_strip_underscores(key), table[key])
+
+
+def _expand_name_set(names: set) -> None:
+    for name in list(names):
+        names.add(_strip_underscores(name))
+
+
+for _table in (UNBOUNDED, FORMAT_INDEXES, BOUNDED_WRITES, HEAP_DEREFERENCE_ARGUMENTS, INPUT_FILLERS, SCANF_FORMAT_INDEX, FILE_STREAM_ARGS, FILE_WRITE_DESTS, FLAG_FD_SINKS):
+    _expand_name_table(_table)
+for _names in (FORMAT_SINKS, COMMAND_SINKS, DEALLOCATORS, FLAG_OPEN_NAMES, OUTPUT_STRING_NAMES):
+    _expand_name_set(_names)
+
+
 def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = "Manual confirmation required before a flag-recovery payload exists.") -> Finding:
     return Finding(identity, title, severity, confidence, sorted(set(evidence), key=str.lower), vector, list(validation), patch, exploit_status, flag_path)
 
 
 def _call_name(call: dict) -> str:
-    return str(call.get("to") or "").rsplit("::", 1)[-1].lstrip("_")
+    """Canonical rule-matching name: drop namespace, version suffix and leading underscores."""
+
+    tail = str(call.get("to") or "").rsplit("::", 1)[-1].split("@", 1)[0]
+    return _strip_underscores(tail)
 
 
 def _call_argument(call: dict, index: int) -> dict:
@@ -184,7 +214,7 @@ def _call_sort_key(call: dict) -> int:
 def _flag_open_calls(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]:
     result: dict[str, list[tuple[dict, str]]] = {}
     for call in calls:
-        if _normalized_call_name(call) not in FLAG_OPEN_NAMES:
+        if _call_name(call) not in FLAG_OPEN_NAMES:
             continue
         argument = _call_argument(call, 0)
         text = argument.get("string") if argument.get("kind") == "address_constant" else None
@@ -197,7 +227,7 @@ def _flag_open_calls(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]
 def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[int, str, str]]]:
     result: dict[str, list[tuple[int, str, str]]] = {}
     for call in calls:
-        if _normalized_call_name(call) not in OUTPUT_STRING_NAMES:
+        if _call_name(call) not in OUTPUT_STRING_NAMES:
             continue
         argument = _call_argument(call, 0)
         text = argument.get("string") if argument.get("kind") == "address_constant" else None
@@ -453,10 +483,6 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     return None
 
 
-def _normalized_call_name(call: dict) -> str:
-    return _normalize_import_name(str(call.get("to") or ""))
-
-
 def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
     format_arg = _call_argument(call, format_index)
     format_str = format_arg.get("string") if format_arg.get("kind") == "address_constant" else None
@@ -482,7 +508,7 @@ def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
 def _bounded_scanf_imports(ghidra_calls: Sequence[dict]) -> set[str]:
     calls_by_name: dict[str, list[dict]] = {}
     for call in ghidra_calls:
-        name = _normalized_call_name(call)
+        name = _call_name(call)
         if name in SCANF_FORMAT_INDEX:
             calls_by_name.setdefault(name, []).append(call)
     return {
@@ -493,17 +519,16 @@ def _bounded_scanf_imports(ghidra_calls: Sequence[dict]) -> set[str]:
 
 def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports: set[str], string_hints: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     bounded_scanf = _bounded_scanf_imports(ghidra_calls)
-    dangerous = sorted((imports & set(UNBOUNDED)) - bounded_scanf, key=str.lower)
+    dangerous = sorted(
+        (name for name in imports & set(UNBOUNDED) if _strip_underscores(name) not in bounded_scanf),
+        key=str.lower,
+    )
     if not dangerous:
         return None
-    dangerous_set = set(dangerous)
+    dangerous_set = set(dangerous) | {_strip_underscores(name) for name in dangerous}
     proven = sorted(dangerous_set & parsed_imports, key=str.lower)
     hints = sorted(dangerous_set & string_hints, key=str.lower)
-    callsites = [
-        item for item in ghidra_calls
-        if str(item.get("to", "")).rsplit("::", 1)[-1] in dangerous_set
-        or _normalize_import_name(str(item.get("to", ""))) in dangerous_set
-    ]
+    callsites = [item for item in ghidra_calls if _call_name(item) in dangerous_set]
     reasons = (
         ["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven]
         + ["unverified string hint: %s" % name for name in hints]
@@ -647,7 +672,7 @@ def _flag_output_notes(calls: Sequence[dict]) -> tuple[list[str], str]:
     if not flag_opens:
         return notes, ""
     for call in calls:
-        name = _normalized_call_name(call)
+        name = _call_name(call)
         if name not in FLAG_FD_SINKS:
             continue
         function = str(call.get("function") or UNKNOWN)
@@ -715,7 +740,7 @@ def _collect_file_stream_identities(ghidra_calls: Sequence[dict]) -> tuple[set[t
     local_streams: set[tuple[str, str]] = set()
     global_streams: set[str] = set()
     for call in ghidra_calls:
-        name = _normalized_call_name(call)
+        name = _call_name(call)
         indexes = FILE_STREAM_ARGS.get(name, set())
         if not indexes:
             continue
@@ -749,7 +774,7 @@ def _check_file_streams(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     evidence: list[str] = []
     closed: dict[tuple[str, str], dict] = {}
     for call in sorted(ghidra_calls, key=_call_position):
-        name = _normalized_call_name(call)
+        name = _call_name(call)
         function = str(call.get("function") or UNKNOWN)
         if name in FILE_WRITE_DESTS:
             dst = _call_argument(call, FILE_WRITE_DESTS[name])

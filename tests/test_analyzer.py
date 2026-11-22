@@ -851,3 +851,54 @@ def test_merge_ghidra_without_string_addresses_keeps_unbounded_scanf(tmp_path):
     merged = _merge_ghidra(info(), export)
     assert "string" not in merged.metadata["ghidra"]["calls"][0]["arguments"][0]
     assert any(item.id == "PWN-BOF-001" for item in analyze(merged))
+
+
+def test_call_name_normalization_matches_prefixed_ghidra_targets():
+    from pwnscan.analyzer import (
+        BOUNDED_WRITES,
+        FILE_STREAM_ARGS,
+        FORMAT_INDEXES,
+        SCANF_FORMAT_INDEX,
+        UNBOUNDED,
+        _call_name,
+    )
+
+    assert _call_name({"to": "__isoc99_scanf"}) == "isoc99_scanf"
+    assert _call_name({"to": "EXTERNAL::__isoc99_fscanf@GLIBC_2.2.5"}) == "isoc99_fscanf"
+    assert _call_name({"to": "__read_chk"}) == "read_chk"
+    assert _call_name({"to": "_printf"}) == "printf"
+    # Every prefixed rule-table key must be reachable through the stripped form.
+    assert "isoc99_scanf" in UNBOUNDED
+    assert "isoc99_fscanf" in SCANF_FORMAT_INDEX
+    assert "isoc99_fscanf" in FILE_STREAM_ARGS
+    assert "read_chk" in BOUNDED_WRITES
+    assert "printf_chk" in FORMAT_INDEXES
+
+
+def test_file_stream_rule_matches_prefixed_fscanf_after_fclose():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "fclose", "arguments": [
+            {"kind": "stack", "stack_offset": -8, "high_name": "stderr"},
+        ]},
+        {"from": "00401140", "function": "main", "to": "__isoc99_fscanf", "arguments": [
+            {"kind": "stack", "stack_offset": -8, "high_name": "stderr"},
+            {"kind": "address_constant", "address": "00402000", "string": "%127s"},
+        ]},
+    ]}}))
+    file_finding = next(item for item in findings if item.id == "PWN-FILE-001")
+    assert any("isoc99_fscanf" in evidence or "fscanf" in evidence for evidence in file_finding.evidence)
+
+
+def test_exact_ret2win_withheld_when_canary_presence_unknown():
+    findings = analyze(info(
+        imports=["read"], symbols=["print_flag"],
+        mitigations={"nx": True, "pie": False, "stack_canary": None},
+        metadata={"symbol_addresses": {"print_flag": 0x401234}, "parsed_imports": ["read"], "ghidra": {"calls": [
+            {"from": "00401110", "function": "main", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "stack", "stack_offset": -80, "buffer_size": 64, "return_address_offset": 72, "variable": "name"},
+                {"kind": "constant", "value": 256},
+            ]},
+        ]}},
+    ))
+    assert not any(item.id == "PWN-FLAG-CHAIN-001" for item in findings)

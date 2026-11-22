@@ -179,10 +179,15 @@ def _elf_header_fields(data: bytes, bits: int, endian_char: str) -> Tuple[int, .
     return tuple(_u(data, at, wide, endian_char) for at in offsets) + tuple(_u(data, at, "H", endian_char) for at in small)
 
 
-def _elf_stack_canary(data: bytes, symbols: Sequence[str], has_symtab: bool) -> bool:
+def _elf_stack_canary(data: bytes, symbols: Sequence[str], has_symtab: bool) -> Optional[bool]:
     if any(name in {"__stack_chk_fail", "__stack_chk_guard"} or name.startswith("__stack_chk_fail@") for name in symbols):
         return True
-    return not has_symtab and b"__stack_chk_fail" in data
+    if has_symtab:
+        return False
+    if b"__stack_chk_fail" in data:
+        return True
+    # Stripped binary without the canary symbol: presence is unknown, not absent.
+    return None
 
 
 def _elf_fortify(fortified_imports: Sequence[str], undefined_symbols: Sequence[str], has_symtab: bool) -> Optional[bool]:
@@ -774,10 +779,15 @@ def parse_macho(data: bytes) -> BinaryInfo:
     values = extract_strings(data)
     parsed_imports, string_hints, imports = _split_imports(sorted(scan.undefined_symbols), values)
     pie = bool(flags & 0x200000)
-    stack_canary = (
-        any(name in {"__stack_chk_fail", "__stack_chk_guard"} for name in scan.symbols)
-        or (not scan.has_symtab and b"___stack_chk_fail" in data)
-    )
+    if any(name in {"__stack_chk_fail", "__stack_chk_guard"} for name in scan.symbols):
+        stack_canary: Optional[bool] = True
+    elif scan.has_symtab:
+        stack_canary = False
+    elif b"___stack_chk_fail" in data:
+        stack_canary = True
+    else:
+        # Stripped binary without the canary symbol: presence is unknown, not absent.
+        stack_canary = None
     rwx_sections = set(scan.rwx_sections)
     if scan.executable_stack:
         rwx_sections.add("__UNIXSTACK")
