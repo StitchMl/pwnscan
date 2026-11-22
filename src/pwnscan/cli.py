@@ -63,6 +63,7 @@ def main(argv=None) -> int:
     try:
         _check_args(args)
         if args.ghidra_auto:
+            print("pwnscan: running Ghidra headless analysis (timeout: %ds)..." % args.ghidra_timeout, file=sys.stderr)
             generated_export = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
         report = _filtered(args, scan_file(args.target, generated_export or args.ghidra))
         rendered = _render(args, report)

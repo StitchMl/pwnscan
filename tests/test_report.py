@@ -38,6 +38,33 @@ def test_render_text_handles_unknown_entrypoint_no_imports_and_color():
     assert "\033[33m[MEDIUM] PWN-MIT-001 Exploit mitigations disabled\033[0m" in colored
 
 
+def test_render_text_summary_alignment_and_rule():
+    plain = render_text(_sample_report(), color=False)
+    assert "findings: 1 (1 medium)" in plain
+    assert "-" * 60 in plain
+    assert "  confidence: high" in plain
+    assert "  exploit:    validation-only" in plain
+    assert "  flag path:  Manual confirmation required" in plain
+    assert "  evidence:   nx disabled" in plain
+    assert "  vector:     Test vector" in plain
+    assert "  validate:   Confirm loader policy" in plain
+    assert "  patch:      Enable NX" in plain
+
+
+def test_render_text_summary_none_and_multiple_severities():
+    binary = _sample_report().binary
+    empty = ScanReport("pwnscan/v1", "empty.exe", "0" * 64, 1, binary, [])
+    assert "findings: none" in render_text(empty, color=False)
+
+    findings = [
+        Finding("A", "t", "critical", "high", [], "v", [], "p"),
+        Finding("B", "t", "critical", "high", [], "v", [], "p"),
+        Finding("C", "t", "low", "low", [], "v", [], "p"),
+    ]
+    report = ScanReport("pwnscan/v1", "multi.exe", "0" * 64, 1, binary, findings)
+    assert "findings: 3 (2 critical, 1 low)" in render_text(report, color=False)
+
+
 def test_render_json_compact_and_pretty():
     compact = render_json(_sample_report(), pretty=False)
     pretty = render_json(_sample_report(), pretty=True)

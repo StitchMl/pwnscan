@@ -179,7 +179,7 @@ def test_text_has_vector_and_patch():
     text = render_text(scan_bytes(minimal_elf64(b"gets\0"), "fixture"), color=False)
     assert "vector:" in text
     assert "patch:" in text
-    assert "exploit: validation-only" in text
+    assert "exploit:    validation-only" in text
     assert "flag path:" in text
     assert "\x1b[" not in text
 

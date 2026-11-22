@@ -53,7 +53,9 @@ def test_cli_runs_optional_headless_export(tmp_path, capsys, monkeypatch):
     assert main([str(target), "--ghidra-auto", "--ghidra-timeout", "19", "--format", "json"]) == 0
     assert calls == [(target, None, None, 19)]
     assert not export.exists()
-    assert '"schema":"pwnscan/v1"' in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert '"schema":"pwnscan/v1"' in captured.out
+    assert "running Ghidra headless analysis (timeout: 19s)" in captured.err
 
 
 def test_cli_rejects_two_ghidra_sources(tmp_path, capsys):

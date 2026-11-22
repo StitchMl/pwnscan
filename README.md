@@ -24,7 +24,7 @@ Set `PYTHONPATH=src` for the second form when running from a checkout.
 
 ## Output
 
-Text output includes binary metadata, mitigations, evidence, an attack vector,
+Text output includes binary metadata, mitigations, a per-severity findings summary, evidence, an attack vector,
 an exploit-readiness state, a flag path, validation steps, and a defensive
 patch. JSON output uses the stable
 `pwnscan/v1` schema.
