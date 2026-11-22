@@ -36,7 +36,11 @@ HEAP_DEREFERENCE_ARGUMENTS = {
     "memcpy": {0, 1}, "memmove": {0, 1}, "strcpy": {0, 1}, "strcat": {0, 1}, "strncat": {0, 1},
     "fgets": {0}, "snprintf": {0}, "puts": {0}, "strlen": {0}, "realloc": {0},
     "fwrite": {0}, "fread": {0}, "fputs": {0},
+    "strcmp": {0, 1}, "strncmp": {0, 1}, "memcmp": {0, 1},
+    "strcasecmp": {0, 1}, "strncasecmp": {0, 1},
+    "strstr": {0}, "strcasestr": {0}, "strchr": {0}, "strrchr": {0},
 }
+INPUT_FILLERS = {"read": 1, "recv": 1, "recvfrom": 1, "fgets": 0, "gets": 0}
 SCANF_FORMAT_INDEX = {
     "scanf": 0, "__isoc99_scanf": 0, "vscanf": 0,
     "sscanf": 1, "__isoc99_sscanf": 1, "vsscanf": 1,
@@ -465,19 +469,59 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
     )
 
 
+def _format_input_sources(ghidra_calls: Sequence[dict]) -> dict[int, str]:
+    """Map id() of a dynamic format call to evidence of the input call filling its format buffer."""
+    fillers: list[tuple[str, str, dict]] = []
+    for call in ghidra_calls:
+        name = _call_name(call)
+        if name in INPUT_FILLERS:
+            dest = _call_argument(call, INPUT_FILLERS[name])
+            identity = _argument_identity(dest)
+            if identity is not None:
+                fillers.append((str(call.get("function") or UNKNOWN), identity, call))
+    sources: dict[int, str] = {}
+    for call in ghidra_calls:
+        if _call_name(call) not in FORMAT_INDEXES:
+            continue
+        argument = _call_argument(call, FORMAT_INDEXES[_call_name(call)])
+        if not _dynamic_argument(argument):
+            continue
+        identity = _argument_identity(argument)
+        if identity is None:
+            continue
+        function = str(call.get("function") or UNKNOWN)
+        for filler_function, filler_identity, filler_call in fillers:
+            if filler_function == function and filler_identity == identity:
+                length = _call_argument(filler_call, 2).get("value") if _call_name(filler_call) in {"read", "recv", "recvfrom"} else None
+                detail = " (%d bytes)" % length if isinstance(length, int) else ""
+                sources[id(call)] = (
+                    "format argument at %s is the buffer filled by %s at %s%s"
+                    % (call.get("from"), _call_name(filler_call), filler_call.get("from"), detail)
+                )
+                break
+    return sources
+
+
 def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     dynamic_format_calls = [
         call for call in ghidra_calls
         if _call_name(call) in FORMAT_INDEXES and _dynamic_argument(_call_argument(call, FORMAT_INDEXES[_call_name(call)]))
     ]
     if dynamic_format_calls:
+        sources = _format_input_sources(ghidra_calls)
         call_evidence = [
             "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to"))
             for item in dynamic_format_calls
         ]
+        call_evidence.extend(sources[id(item)] for item in dynamic_format_calls if id(item) in sources)
+        vector = "Send `%p.%p.%p` to confirm pointer disclosure. If the same input reaches `%n`, use a positional write only after mapping the argument index in the isolated CTF runner."
+        if info.format == "ELF" and info.metadata.get("relro") in {"none", "partial"}:
+            vector += " Full RELRO is off, so the GOT remains a writable `%n` target."
+        elif not info.mitigations.get("pie" if info.format in {"ELF", "Mach-O"} else "aslr"):
+            vector += " Code and writable data are at fixed addresses, giving `%n` a deterministic target."
         return _finding(
             "PWN-FMT-001", "Attacker-reachable dynamic format candidate", "high", "high", call_evidence,
-            "Send `%p.%p.%p` to confirm pointer disclosure. If the same input reaches `%n`, use a positional write only after mapping the argument index in the isolated CTF runner.",
+            vector,
             ["Compare output for a literal marker and `%p.%p.%p`.", "Confirm the decompiled format argument comes from challenge input."],
             "Pass a constant format such as `%s` and move the dynamic value to a separate argument.",
         )

@@ -529,3 +529,78 @@ def test_fwrite_after_free_is_reported_as_uaf():
         {"from": "00402004", "function": "challenge", "to": "fwrite", "arguments": [pointer, {"kind": "constant", "value": 1}, {"kind": "constant", "value": 16}, dynamic("fp")]},
     ]}}))
     assert any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_format_string_input_source_is_correlated_with_read():
+    buffer = {"kind": "stack", "repr": "(register, 0x0, 8)", "stack_offset": -323, "return_address_offset": 323}
+    findings = analyze(info(
+        imports=["printf", "read"],
+        metadata={"parsed_imports": ["printf", "read"], "ghidra": {"calls": [
+            {"from": "00101802", "function": "func", "to": "read", "arguments": [
+                {"kind": "constant", "value": 0}, buffer, {"kind": "constant", "value": 256}]},
+            {"from": "00101875", "function": "func", "to": "printf", "arguments": [buffer]},
+        ]}},
+    ))
+    finding = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert finding.severity == "high"
+    assert any("buffer filled by read at 00101802 (256 bytes)" in line for line in finding.evidence)
+
+
+def test_format_string_without_matching_input_source_has_no_correlation():
+    findings = analyze(info(
+        imports=["printf"], metadata={"parsed_imports": ["printf"], "ghidra": {"calls": [
+            {"from": "00401020", "function": "main", "to": "printf", "arguments": [{"kind": "stack", "stack_offset": -64}]},
+        ]}},
+    ))
+    finding = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert not any("buffer filled by" in line for line in finding.evidence)
+
+
+def test_format_string_vector_notes_writable_got_when_relro_partial():
+    findings = analyze(info(
+        imports=["printf"], mitigations={"nx": True, "pie": True, "stack_canary": True},
+        metadata={"parsed_imports": ["printf"], "relro": "partial", "ghidra": {"calls": [
+            {"from": "00401020", "function": "main", "to": "printf", "arguments": [{"kind": "stack", "stack_offset": -64}]},
+        ]}},
+    ))
+    finding = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert "GOT remains a writable `%n` target" in finding.attack_vector
+
+
+def test_format_string_vector_notes_fixed_addresses_when_not_pie():
+    findings = analyze(info(
+        imports=["printf"], mitigations={"nx": True, "pie": False, "stack_canary": True},
+        metadata={"parsed_imports": ["printf"], "relro": "full", "ghidra": {"calls": [
+            {"from": "00401020", "function": "main", "to": "printf", "arguments": [{"kind": "stack", "stack_offset": -64}]},
+        ]}},
+    ))
+    finding = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert "fixed addresses" in finding.attack_vector
+
+
+def test_strcmp_after_free_is_reported_as_uaf():
+    pointer = dynamic("secret")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00101100", "function": "challenge", "to": "free", "arguments": [pointer]},
+        {"from": "00101ba6", "function": "challenge", "to": "strcmp", "arguments": [pointer, dynamic("input")]},
+    ]}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any("strcmp" in line for line in uaf.evidence)
+
+
+def test_memcmp_after_free_is_reported_as_uaf():
+    pointer = dynamic("chunk")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "check", "to": "free", "arguments": [pointer]},
+        {"from": "00401200", "function": "check", "to": "memcmp", "arguments": [pointer, dynamic("ref"), {"kind": "constant", "value": 16}]},
+    ]}}))
+    assert any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_strcmp_before_free_is_not_reported_as_uaf():
+    pointer = dynamic("secret")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00101100", "function": "challenge", "to": "strcmp", "arguments": [pointer, dynamic("input")]},
+        {"from": "00101f71", "function": "challenge", "to": "free", "arguments": [pointer]},
+    ]}}))
+    assert not any(item.id == "PWN-HEAP-002" for item in findings)
