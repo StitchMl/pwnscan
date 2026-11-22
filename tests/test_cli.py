@@ -98,3 +98,22 @@ def test_cli_output_file_and_invalid_timeout(tmp_path, capsys):
 
     assert main([str(target), "--ghidra-timeout", "0"]) == 2
     assert "--ghidra-timeout must be positive" in capsys.readouterr().err
+
+
+def test_cli_ghidra_keep_saves_export_and_requires_auto(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "generated.json"
+    export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[],"imports":[],"calls":[]}', encoding="utf-8")
+    kept = tmp_path / "kept.json"
+
+    def fake_export(actual_target, home, script, timeout):
+        return export
+
+    monkeypatch.setattr("pwnscan.cli.export_headless", fake_export)
+    assert main([str(target), "--ghidra-keep", str(kept)]) == 2
+    assert "--ghidra-keep requires --ghidra-auto" in capsys.readouterr().err
+    assert main([str(target), "--ghidra-auto", "--ghidra-keep", str(kept)]) == 0
+    assert kept.is_file()
+    assert kept.read_text(encoding="utf-8").startswith('{"schema":"pwnscan-ghidra/v1"')
+    assert not export.exists()

@@ -697,3 +697,50 @@ def test_named_ghidra_call_target_is_never_rewritten_by_plt_map(tmp_path):
     }), encoding="utf-8")
     merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x401130": "printf"}}), export)
     assert merged.metadata["ghidra"]["calls"][0]["to"] == "puts"
+
+
+def test_heap_uaf_on_flag_buffer_reports_flag_path():
+    pointer = dynamic("chunk")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401000", "function": "main", "to": "open", "arguments": [
+            {"kind": "address_constant", "string": "/flag", "address": "00402000", "writable": False},
+            {"kind": "constant", "value": 0},
+        ]},
+        {"from": "00401100", "function": "main", "to": "read", "arguments": [
+            {"kind": "dynamic", "repr": "(register, 0x0, 4)", "expression": {"op": "CALL"}}, pointer, {"kind": "constant", "value": 128},
+        ]},
+        {"from": "00401200", "function": "main", "to": "free", "arguments": [pointer]},
+        {"from": "00401300", "function": "main", "to": "puts", "arguments": [pointer]},
+    ]}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any("flag file '/flag' opened at 00401000" in line for line in uaf.evidence)
+    assert "Leak the flag buffer" in uaf.flag_path
+
+
+def test_heap_uaf_without_flag_open_keeps_default_flag_path():
+    pointer = dynamic("chunk")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401200", "function": "main", "to": "free", "arguments": [pointer]},
+        {"from": "00401300", "function": "main", "to": "puts", "arguments": [pointer]},
+    ]}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert uaf.flag_path == "Manual confirmation required before a flag-recovery payload exists."
+
+
+def test_guard_string_between_free_and_use_is_annotated():
+    pointer = dynamic("chunk")
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00402000", "function": "main", "to": "free", "arguments": [pointer]},
+        {"from": "00402100", "function": "main", "to": "puts", "arguments": [pointer]},
+        {"from": "00402200", "function": "main", "to": "puts", "arguments": [
+            {"kind": "address_constant", "string": "Cannot read to freed indexes!", "address": "00403000", "writable": False},
+        ]},
+        {"from": "00402300", "function": "main", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0}, pointer, {"kind": "constant", "value": 16},
+        ]},
+    ]}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    read_line = next(line for line in uaf.evidence if "to read argument 1 at 00402300" in line)
+    puts_line = next(line for line in uaf.evidence if "to puts argument 0 at 00402100" in line)
+    assert "guard string 'Cannot read to freed indexes!' at 00402200" in read_line
+    assert "guard string" not in puts_line

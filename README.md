@@ -89,7 +89,9 @@ pwnscan ./challenge --ghidra-auto --ghidra-home C:\Tools\ghidra_12.0_PUBLIC
 ```
 
 Set `GHIDRA_HOME` instead of passing `--ghidra-home`. `--ghidra-timeout`
-limits analysis time. Ghidra reads and decompiles the target; it never runs it.
+limits analysis time. Add `--ghidra-keep EXPORT.json` to also save the
+generated export next to the report instead of discarding it. Ghidra reads
+and decompiles the target; it never runs it.
 Recovered P-code arguments let `pwnscan` prove constant-size stack overwrites,
 compute saved-return offsets, reject constant `printf("%s", value)` calls, and
 rank dynamic command arguments. Expression trees also expose arithmetic and

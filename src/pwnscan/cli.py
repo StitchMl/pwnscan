@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-severity", choices=("critical", "high", "medium", "low", "info"), help="only include findings at this severity or higher")
     result.add_argument("--ghidra", type=Path, metavar="EXPORT.json", help="merge deterministic metadata exported by PwnscanExport.java")
     result.add_argument("--ghidra-auto", action="store_true", help="run optional Ghidra headless analysis and merge its export")
+    result.add_argument("--ghidra-keep", type=Path, metavar="EXPORT.json", help="with --ghidra-auto, also save the generated Ghidra export to this file")
     result.add_argument("--ghidra-home", type=Path, help="Ghidra installation directory for --ghidra-auto")
     result.add_argument("--ghidra-script", type=Path, help=argparse.SUPPRESS)
     result.add_argument("--ghidra-timeout", type=int, default=300, metavar="SECONDS", help="headless timeout; default: 300")
@@ -32,6 +34,12 @@ def parser() -> argparse.ArgumentParser:
 def _check_args(args: argparse.Namespace) -> None:
     if args.ghidra and args.ghidra_auto:
         raise ValueError("choose either --ghidra or --ghidra-auto")
+    if args.ghidra_keep and not args.ghidra_auto:
+        raise ValueError("--ghidra-keep requires --ghidra-auto")
+    if args.ghidra_keep is not None:
+        keep = args.ghidra_keep.resolve()
+        if keep.is_dir() or not keep.parent.is_dir():
+            raise ValueError("invalid Ghidra export path: %s" % args.ghidra_keep)
     if args.ghidra_timeout < 1:
         raise ValueError("--ghidra-timeout must be positive")
     if args.output is not None:
@@ -65,6 +73,8 @@ def main(argv=None) -> int:
         if args.ghidra_auto:
             print("pwnscan: running Ghidra headless analysis (timeout: %ds)..." % args.ghidra_timeout, file=sys.stderr)
             generated_export = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
+            if args.ghidra_keep is not None:
+                shutil.copyfile(generated_export, args.ghidra_keep.resolve())
         report = _filtered(args, scan_file(args.target, generated_export or args.ghidra))
         rendered = _render(args, report)
         if args.output is not None:

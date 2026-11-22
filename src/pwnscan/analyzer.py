@@ -69,6 +69,9 @@ ARITHMETIC_WRAP_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT", "INT_SUB"}
 WIDTH_CHANGE_OPS = {"INT_SEXT", "SUBPIECE"}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
+FLAG_OPEN_NAMES = {"open", "open64", "openat", "fopen"}
+OUTPUT_STRING_NAMES = {"puts", "printf", "fputs", "write", "fprintf", "dprintf", "perror"}
+GUARD_TEXT = re.compile(r"cannot|invalid|freed|denied|forbidden|not allowed|error|failed", re.I)
 
 
 def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = "Manual confirmation required before a flag-recovery payload exists.") -> Finding:
@@ -173,11 +176,45 @@ def _record_free(call: dict, function: str, freed: dict, double_free: list) -> N
         freed[key] = call
 
 
-def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[str]]:
+def _call_sort_key(call: dict) -> int:
+    return _call_position(call)[1]
+
+
+def _flag_open_calls(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]:
+    result: dict[str, list[tuple[dict, str]]] = {}
+    for call in calls:
+        if _normalized_call_name(call) not in FLAG_OPEN_NAMES:
+            continue
+        argument = _call_argument(call, 0)
+        text = argument.get("string") if argument.get("kind") == "address_constant" else None
+        if isinstance(text, str) and text and FLAG_TEXT.search(text):
+            function = str(call.get("function") or UNKNOWN)
+            result.setdefault(function, []).append((call, text))
+    return result
+
+
+def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[int, str, str]]]:
+    result: dict[str, list[tuple[int, str, str]]] = {}
+    for call in calls:
+        if _normalized_call_name(call) not in OUTPUT_STRING_NAMES:
+            continue
+        argument = _call_argument(call, 0)
+        text = argument.get("string") if argument.get("kind") == "address_constant" else None
+        if isinstance(text, str) and text and GUARD_TEXT.search(text):
+            function = str(call.get("function") or UNKNOWN)
+            result.setdefault(function, []).append((_call_sort_key(call), str(call.get("from") or ""), text))
+    return result
+
+
+def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[str], list[str]]:
     double_free: list[str] = []
     use_after_free: list[str] = []
+    flag_notes: list[str] = []
     freed: dict[tuple[str, str], dict] = {}
-    for call in sorted(calls, key=_call_position):
+    ordered = sorted(calls, key=_call_position)
+    guards = _guard_strings(ordered)
+    flag_opens = _flag_open_calls(ordered)
+    for call in ordered:
         function = str(call.get("function") or UNKNOWN)
         name = _call_name(call)
         if name in DEALLOCATORS:
@@ -187,12 +224,26 @@ def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[st
         for index in indexes:
             identity = _argument_identity(_call_argument(call, index))
             previous = freed.get((function, identity or ""))
-            if previous is not None:
-                use_after_free.append(
-                    "%s passes freed %s to %s argument %d at %s; free at %s"
-                    % (function, identity, name, index, call.get("from"), previous.get("from"))
+            if previous is None:
+                continue
+            entry = "%s passes freed %s to %s argument %d at %s; free at %s" % (
+                function, identity, name, index, call.get("from"), previous.get("from"),
+            )
+            for guard_pos, guard_from, guard_text in guards.get(function, []):
+                if _call_sort_key(previous) < guard_pos < _call_sort_key(call):
+                    entry += "; guard string %r at %s intervenes between free and use" % (guard_text, guard_from)
+                    break
+            use_after_free.append(entry)
+            for open_call, path in flag_opens.get(function, []):
+                flag_notes.append(
+                    "flag file %r opened at %s in %s; buffer %s freed at %s and reused by %s at %s may alias the flag buffer"
+                    % (path, open_call.get("from"), function, identity, previous.get("from"), name, call.get("from"))
                 )
-    return sorted(set(double_free), key=str.lower), sorted(set(use_after_free), key=str.lower)
+    return (
+        sorted(set(double_free), key=str.lower),
+        sorted(set(use_after_free), key=str.lower),
+        sorted(set(flag_notes), key=str.lower),
+    )
 
 
 def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
@@ -341,7 +392,7 @@ def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
 
 def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
     findings: List[Finding] = []
-    double_free, use_after_free = _heap_lifetime_candidates(ghidra_calls)
+    double_free, use_after_free, flag_notes = _heap_lifetime_candidates(ghidra_calls)
     if double_free:
         findings.append(_finding(
             "PWN-HEAP-001", "Repeated free of the same recovered pointer", "high", "medium", double_free,
@@ -350,11 +401,20 @@ def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
             "Give each allocation one owner and clear or transfer the pointer after free.",
         ))
     if use_after_free:
+        flag_path = "Manual confirmation required before a flag-recovery payload exists."
+        if flag_notes:
+            flag_path = (
+                "Leak the flag buffer through the reported use-after-free: %s. "
+                "Reclaim the freed chunk and read it back with puts/write before reallocating it."
+                % flag_notes[0]
+            )
         findings.append(_finding(
-            "PWN-HEAP-002", "Freed pointer reused by a memory operation", "high", "medium", use_after_free,
+            "PWN-HEAP-002", "Freed pointer reused by a memory operation", "high", "medium",
+            use_after_free + flag_notes,
             "Reach the free and later dereference on one path, reclaim the same size class with controlled data, then test whether the reported operation reads or overwrites the replacement object.",
             ["Confirm no reassignment dominates the later use.", "Use allocator tracing to prove the chunk was reclaimed."],
             "Invalidate aliases after free and enforce object lifetime through single ownership.",
+            flag_path=flag_path,
         ))
     return findings
 
