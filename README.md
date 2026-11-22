@@ -49,6 +49,7 @@ The current engine covers:
 - PE import/export tables, ASLR, DEP, CFG, and RWX sections;
 - unbounded writes, format-string targets, command sinks, ret2win paths, and mitigation gaps;
 - Ghidra-backed constant-length stack overwrites, integer allocation arithmetic, write-length sign/truncation conversions, repeated frees, post-free memory use, and indirect call targets;
+- structural flag-output correlation: `open` of a flag-like path whose descriptor (call result) reaches `sendfile`/`write`/`fwrite`, reported as a candidate flag path on `PWN-WIN-001`;
 - an exact ret2win payload when Ghidra proves the saved-return offset, input
   capacity, fixed target address, and absence of a stack canary.
 

@@ -70,6 +70,7 @@ WIDTH_CHANGE_OPS = {"INT_SEXT", "SUBPIECE"}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
 FLAG_OPEN_NAMES = {"open", "open64", "openat", "fopen"}
+FLAG_FD_SINKS = {"sendfile": 1, "write": 0, "pwrite": 0, "send": 0, "sendto": 0, "fwrite": 3}
 OUTPUT_STRING_NAMES = {"puts", "printf", "fputs", "write", "fprintf", "dprintf", "perror"}
 GUARD_TEXT = re.compile(r"cannot|invalid|freed|denied|forbidden|not allowed|error|failed", re.I)
 
@@ -635,21 +636,58 @@ def _win_address_note(info: BinaryInfo, win_symbols: Sequence[str], symbol_addre
     return "Resolve the routine address before building ret2win."
 
 
-def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str], symbol_addresses: dict) -> List[Finding]:
+def _flag_output_notes(calls: Sequence[dict]) -> tuple[list[str], str]:
+    """Structural correlation: open(flag path) whose fd reaches an output sink.
+
+    Requires a call-result descriptor (expression op CALL), so a plain
+    write(1, ...) to stdout never produces a note.
+    """
+    notes: list[str] = []
+    flag_opens = _flag_open_calls(calls)
+    if not flag_opens:
+        return notes, ""
+    for call in calls:
+        name = _normalized_call_name(call)
+        if name not in FLAG_FD_SINKS:
+            continue
+        function = str(call.get("function") or UNKNOWN)
+        opens = flag_opens.get(function)
+        if not opens:
+            continue
+        descriptor = _call_argument(call, FLAG_FD_SINKS[name])
+        if descriptor.get("kind") != "dynamic" or "CALL" not in _expression_ops(descriptor):
+            continue
+        for open_call, path in opens:
+            notes.append(
+                "flag file %r opened at %s in %s; its descriptor is passed to %s argument %d at %s (candidate flag output)"
+                % (path, open_call.get("from"), function, name, FLAG_FD_SINKS[name], call.get("from"))
+            )
+    notes = sorted(set(notes), key=str.lower)
+    flag_path = ""
+    if notes:
+        flag_path = (
+            "Candidate flag output path: %s. Reach the branch that performs the output after the flag file is opened."
+            % notes[0]
+        )
+    return notes, flag_path
+
+
+def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str], symbol_addresses: dict, flag_output: Sequence[str] = (), flag_output_path: str = "") -> List[Finding]:
     findings: List[Finding] = []
     win_symbols = sorted(name for name in symbols if WIN_NAMES.search(name))
     win_strings = sorted((value for value in info.strings if FLAG_TEXT.search(value)), key=str.lower)[:12]
     exact_chain = _exact_ret2win(info, bounded, win_symbols, symbol_addresses)
     if exact_chain is not None:
         findings.append(exact_chain)
-    if win_symbols or win_strings:
+    if win_symbols or win_strings or flag_output:
         address_note = _win_address_note(info, win_symbols, symbol_addresses)
         findings.append(_finding(
             "PWN-WIN-001", "Hidden success path or flag material", "medium", "high" if win_symbols else "medium",
-            ["symbol: %s" % name for name in win_symbols] + ["string: %s" % value for value in win_strings],
+            ["symbol: %s" % name for name in win_symbols] + ["string: %s" % value for value in win_strings] + list(flag_output),
             "Reach the success routine through a corrupted return address, function pointer, or intended state transition. " + address_note,
             ["Cross-reference each clue.", "List callers and guard conditions for candidate success routines."],
             "Remove dormant privileged paths and keep secrets outside the challenge binary in production software.",
+            flag_path=flag_output_path or "Manual confirmation required before a flag-recovery payload exists.",
         ))
     return findings
 
@@ -760,7 +798,8 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     ]
     findings: List[Finding] = [item for item in candidates if item is not None]
     findings.extend(_check_heap_lifetime(ghidra_calls))
-    findings.extend(_check_win_paths(info, bounded, symbols, symbol_addresses))
+    flag_output, flag_output_path = _flag_output_notes(ghidra_calls)
+    findings.extend(_check_win_paths(info, bounded, symbols, symbol_addresses, flag_output, flag_output_path))
 
     rwx_sections = list(info.metadata.get("rwx_sections", []))
     if rwx_sections:

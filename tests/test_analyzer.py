@@ -744,3 +744,50 @@ def test_guard_string_between_free_and_use_is_annotated():
     puts_line = next(line for line in uaf.evidence if "to puts argument 0 at 00402100" in line)
     assert "guard string 'Cannot read to freed indexes!' at 00402200" in read_line
     assert "guard string" not in puts_line
+
+
+def test_flag_output_via_sendfile_sets_candidate_flag_path():
+    findings = analyze(info(strings=["/flag"], metadata={"ghidra": {"calls": [
+        {"from": "00401000", "function": "main", "to": "open", "arguments": [
+            {"kind": "address_constant", "string": "/flag", "address": "00402000", "writable": False},
+            {"kind": "constant", "value": 0},
+        ]},
+        {"from": "00401100", "function": "main", "to": "sendfile", "arguments": [
+            {"kind": "constant", "value": 1},
+            {"kind": "dynamic", "repr": "(register, 0x0, 4)", "expression": {"op": "CALL"}},
+            {"kind": "constant", "value": 0},
+            {"kind": "constant", "value": 64},
+        ]},
+    ]}}))
+    win = next(item for item in findings if item.id == "PWN-WIN-001")
+    assert any("flag file '/flag' opened at 00401000" in line and "sendfile" in line for line in win.evidence)
+    assert "Candidate flag output path" in win.flag_path
+    assert win.confidence == "medium"
+
+
+def test_write_to_constant_stdout_is_not_a_flag_output():
+    findings = analyze(info(strings=["/flag"], metadata={"ghidra": {"calls": [
+        {"from": "00401000", "function": "main", "to": "open", "arguments": [
+            {"kind": "address_constant", "string": "/flag", "address": "00402000", "writable": False},
+            {"kind": "constant", "value": 0},
+        ]},
+        {"from": "00401100", "function": "main", "to": "write", "arguments": [
+            {"kind": "constant", "value": 1},
+            {"kind": "address_constant", "string": "hello", "address": "00402010", "writable": False},
+            {"kind": "constant", "value": 5},
+        ]},
+    ]}}))
+    win = next(item for item in findings if item.id == "PWN-WIN-001")
+    assert not any("candidate flag output" in line for line in win.evidence)
+    assert win.flag_path == "Manual confirmation required before a flag-recovery payload exists."
+
+
+def test_no_flag_open_no_output_note():
+    findings = analyze(info(strings=["hello"], metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "write", "arguments": [
+            {"kind": "dynamic", "repr": "(register, 0x0, 4)", "expression": {"op": "CALL"}},
+            {"kind": "address_constant", "string": "hello", "address": "00402010", "writable": False},
+            {"kind": "constant", "value": 5},
+        ]},
+    ]}}))
+    assert not any(item.id == "PWN-WIN-001" for item in findings)
