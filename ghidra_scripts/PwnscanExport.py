@@ -206,33 +206,35 @@ def _target_name(program, operation):
 
 def _decompiled_calls(program, monitor):
     interface = DecompInterface()
-    interface.openProgram(program)
-    result = []
-    iterator = program.getFunctionManager().getFunctions(True)
-    while iterator.hasNext():
-        function = iterator.next()
-        if function.isThunk():
-            continue
-        block = program.getMemory().getBlock(function.getEntryPoint())
-        if block is not None and block.getName().startswith(".plt"):
-            continue
-        completed = interface.decompileFunction(function, 30, monitor)
-        high = completed.getHighFunction() if completed is not None and completed.decompileCompleted() else None
-        if high is None:
-            continue
-        operations = high.getPcodeOps()
-        while operations.hasNext():
-            operation = operations.next()
-            if operation.getOpcode() not in (PcodeOp.CALL, PcodeOp.CALLIND):
+    try:
+        interface.openProgram(program)
+        result = []
+        iterator = program.getFunctionManager().getFunctions(True)
+        while iterator.hasNext() and not monitor.isCancelled():
+            function = iterator.next()
+            if function.isThunk():
                 continue
-            arguments = [_argument(program, function, operation.getInput(index)) for index in range(1, operation.getNumInputs())]
-            result.append({
-                "from": str(operation.getSeqnum().getTarget()), "function": function.getName(),
-                "to": _target_name(program, operation), "indirect": operation.getOpcode() == PcodeOp.CALLIND,
-                "target": _argument(program, function, operation.getInput(0)), "arguments": arguments,
-            })
-    interface.dispose()
-    return result
+            block = program.getMemory().getBlock(function.getEntryPoint())
+            if block is not None and block.getName().startswith(".plt"):
+                continue
+            completed = interface.decompileFunction(function, 30, monitor)
+            high = completed.getHighFunction() if completed is not None and completed.decompileCompleted() else None
+            if high is None:
+                continue
+            operations = high.getPcodeOps()
+            while operations.hasNext():
+                operation = operations.next()
+                if operation.getOpcode() not in (PcodeOp.CALL, PcodeOp.CALLIND):
+                    continue
+                arguments = [_argument(program, function, operation.getInput(index)) for index in range(1, operation.getNumInputs())]
+                result.append({
+                    "from": str(operation.getSeqnum().getTarget()), "function": function.getName(),
+                    "to": _target_name(program, operation), "indirect": operation.getOpcode() == PcodeOp.CALLIND,
+                    "target": _argument(program, function, operation.getInput(0)), "arguments": arguments,
+                })
+        return result
+    finally:
+        interface.dispose()
 
 
 def collect(program, monitor):
@@ -247,12 +249,13 @@ def collect(program, monitor):
     while symbols.hasNext():
         imports.append(symbols.next().getName(True))
     calls = _decompiled_calls(program, monitor)
+    # Same ordering as PwnscanExport.java: raw (case-sensitive) to + function + from.
     return {
         "schema": "pwnscan-ghidra/v1", "program": program.getName(),
         "language": str(program.getLanguageID()), "image_base": str(program.getImageBase()),
         "functions": sorted(functions, key=lambda item: (item["name"].lower(), item["entry"])),
         "imports": sorted(set(imports), key=lambda value: (value.lower(), value)),
-        "calls": sorted(calls, key=lambda item: (str(item["to"]).lower(), item["function"].lower(), item["from"])),
+        "calls": sorted(calls, key=lambda item: (str(item["to"]) + "\0" + item["function"] + "\0" + item["from"])),
     }
 
 
@@ -262,9 +265,10 @@ else:
     arguments = getScriptArgs()
     output = File(arguments[0]) if arguments else askFile("Save pwnscan Ghidra export", "Save")
     payload = collect(currentProgram, monitor)
-    handle = open(output.getAbsolutePath(), "w")
+    handle = open(output.getAbsolutePath(), "w", encoding="utf-8")
     try:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        # ensure_ascii=False matches Gson's disableHtmlEscaping output (raw UTF-8).
+        json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
         handle.write("\n")
     finally:
         handle.close()

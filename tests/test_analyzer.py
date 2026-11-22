@@ -988,3 +988,32 @@ def test_indirect_call_with_loaded_target_is_vtable_class():
     ]}}))
     cflow2 = next(item for item in findings if item.id == "PWN-CFLOW-002")
     assert cflow2.severity == "low"
+
+
+def test_dynamic_loading_imports_are_flagged_low():
+    finding = next(item for item in analyze(info(
+        imports=["LoadLibraryA", "GetProcAddress"],
+        metadata={"parsed_imports": ["LoadLibraryA", "GetProcAddress"]},
+    )) if item.id == "PWN-DYNLOAD-001")
+    assert finding.severity == "low"
+    assert any("LoadLibraryA" in evidence for evidence in finding.evidence)
+
+
+def test_guarded_use_after_free_is_marked():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "free", "arguments": [
+            {"kind": "dynamic", "repr": "(unique, 0xc300, 8)", "high_name": "ptr"},
+        ]},
+        {"from": "00401110", "function": "main", "to": "puts", "arguments": [
+            {"kind": "dynamic", "repr": "(unique, 0xc300, 8)", "high_name": "ptr"},
+        ]},
+        {"from": "00401120", "function": "main", "to": "puts", "arguments": [
+            {"kind": "address_constant", "address": "00402000", "string": "Cannot puts freed indexes!"},
+        ]},
+        {"from": "00401140", "function": "main", "to": "puts", "arguments": [
+            {"kind": "dynamic", "repr": "(unique, 0xc300, 8)", "high_name": "ptr"},
+        ]},
+    ]}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any(evidence.startswith("[guarded]") for evidence in uaf.evidence)
+    assert any(not evidence.startswith("[guarded]") for evidence in uaf.evidence)

@@ -32,7 +32,7 @@ INTERESTING_APIS = (
     "system", "popen", "execve", "execv", "execvp", "execvpe", "execl",
     "execlp", "execle", "posix_spawn", "posix_spawnp", "wordexp",
     "mprotect", "VirtualProtect", "WinExec",
-    "CreateProcess", "LoadLibrary", "GetProcAddress", "dlopen",
+    "CreateProcess", "LoadLibrary", "LoadLibraryA", "LoadLibraryW", "GetProcAddress", "dlopen", "dlsym",
     "prctl", "seccomp", "seccomp_init", "seccomp_rule_add",
     "malloc", "calloc", "realloc", "free", "operator new", "operator delete",
 )
@@ -689,15 +689,16 @@ def _macho_record_symbol(name: str, n_type: int, n_sect: int, n_value: int, unde
         addresses[name] = n_value
 
 
-def _macho_symtab(data: bytes, bits: int, endian: str, at: int) -> Tuple[Set[str], Set[str], Dict[str, int]]:
+def _macho_symtab(data: bytes, bits: int, endian: str, at: int) -> Tuple[Set[str], Set[str], Dict[str, int], List[str]]:
     symbols: Set[str] = set()
     undefined: Set[str] = set()
+    undefined_ordered: List[str] = []
     addresses: Dict[str, int] = {}
     symoff, nsyms, stroff, strsize = struct.unpack_from(endian + "IIII", data, at + 8)
     str_end = min(len(data), stroff + strsize)
     nlist_size = 16 if bits == 64 else 12
     if stroff >= len(data) or symoff >= len(data):
-        return symbols, undefined, addresses
+        return symbols, undefined, addresses, undefined_ordered
     value_fmt = "Q" if bits == 64 else "I"
     for index in range(min(nsyms, 65535)):
         sym_at = symoff + index * nlist_size
@@ -714,8 +715,10 @@ def _macho_symtab(data: bytes, bits: int, endian: str, at: int) -> Tuple[Set[str
             continue
         clean_name = raw_name[1:] if raw_name.startswith("_") else raw_name
         symbols.add(clean_name)
+        if (n_type & 0x0E) == 0x0 and (n_type & 0x01) and n_sect == 0 and clean_name not in undefined:
+            undefined_ordered.append(clean_name)
         _macho_record_symbol(clean_name, n_type, n_sect, n_value, undefined, addresses)
-    return symbols, undefined, addresses
+    return symbols, undefined, addresses, undefined_ordered
 
 
 @dataclass
@@ -727,8 +730,34 @@ class _MachoScan:
     rwx_sections: Set[str] = field(default_factory=set)
     symbols: Set[str] = field(default_factory=set)
     undefined_symbols: Set[str] = field(default_factory=set)
+    undefined_ordered: List[str] = field(default_factory=list)
     symbol_addresses: Dict[str, int] = field(default_factory=dict)
+    stub_sections: List[Tuple[int, int, int]] = field(default_factory=list)  # (va, size, stub_size)
     has_symtab: bool = False
+
+
+S_SYMBOL_STUBS = 0x08
+
+
+def _macho_segment_sections(data: bytes, endian: str, at: int, wide: bool, scan: _MachoScan) -> None:
+    nsects_at = at + (64 if wide else 48)
+    sect_at = at + (72 if wide else 56)
+    sect_size = 80 if wide else 68
+    if nsects_at + 4 > len(data):
+        return
+    nsects = _u(data, nsects_at, "I", endian)
+    addr_fmt = "Q" if wide else "I"
+    for index in range(min(nsects, 255)):
+        base = sect_at + index * sect_size
+        if base + sect_size > len(data):
+            break
+        sectname = data[base:base + 16].split(b"\0", 1)[0].decode("ascii", "replace")
+        addr = _u(data, base + 32, addr_fmt, endian)
+        size = _u(data, base + (40 if wide else 36), addr_fmt, endian)
+        flags = _u(data, base + (64 if wide else 56), "I", endian)
+        reserved2 = _u(data, base + (72 if wide else 60), "I", endian)
+        if sectname == "__stubs" and (flags & 0xFF) == S_SYMBOL_STUBS and reserved2 > 0:
+            scan.stub_sections.append((addr, size, reserved2))
 
 
 def _macho_segment(data: bytes, endian: str, at: int, command: int, scan: _MachoScan) -> None:
@@ -742,6 +771,7 @@ def _macho_segment(data: bytes, endian: str, at: int, command: int, scan: _Macho
         scan.executable_stack = True
     if (initprot & 0x6) == 0x6:
         scan.rwx_sections.add(segname or "segment")
+    _macho_segment_sections(data, endian, at, wide, scan)
 
 
 def _macho_command(data: bytes, bits: int, endian: str, at: int, command: int, size: int, scan: _MachoScan) -> None:
@@ -755,9 +785,10 @@ def _macho_command(data: bytes, bits: int, endian: str, at: int, command: int, s
         _macho_segment(data, endian, at, command, scan)
     elif command == 0x2 and size >= 24:
         scan.has_symtab = True
-        syms, undef, addrs = _macho_symtab(data, bits, endian, at)
+        syms, undef, addrs, undef_ordered = _macho_symtab(data, bits, endian, at)
         scan.symbols.update(syms)
         scan.undefined_symbols.update(undef)
+        scan.undefined_ordered.extend(undef_ordered)
         scan.symbol_addresses.update(addrs)
 
 
@@ -806,6 +837,15 @@ def parse_macho(data: bytes) -> BinaryInfo:
     if scan.executable_stack:
         rwx_sections.add("__UNIXSTACK")
     symbol_addresses = scan.symbol_addresses
+    # Heuristic stub map: the i-th __stubs entry binds the i-th undefined symbol
+    # (dyld orders them correspondingly); used to resolve Ghidra auto-labels.
+    plt_addresses: Dict[str, str] = {}
+    for stub_va, stub_total, stub_size in scan.stub_sections:
+        for index, name in enumerate(scan.undefined_ordered):
+            stub_addr = stub_va + index * stub_size
+            if stub_total and stub_addr >= stub_va + stub_total:
+                break
+            plt_addresses["0x%x" % stub_addr] = name
     return BinaryInfo(
         format="Mach-O", bits=bits, endian="big" if endian == ">" else "little",
         architecture=MACH_CPU.get(cpu, "cpu-%d" % cpu), entrypoint=entry,
@@ -818,5 +858,6 @@ def parse_macho(data: bytes) -> BinaryInfo:
             "parsed_imports": parsed_imports, "string_import_hints": string_hints,
             "symbol_addresses": {name: symbol_addresses[name] for name in sorted(symbol_addresses, key=str.lower)},
             "rwx_sections": sorted(rwx_sections, key=str.lower),
+            "plt_addresses": {key: plt_addresses[key] for key in sorted(plt_addresses, key=lambda value: int(value, 16))},
         },
     )

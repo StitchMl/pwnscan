@@ -47,7 +47,12 @@ HEAP_DEREFERENCE_ARGUMENTS = {
     "strcasecmp": {0, 1}, "strncasecmp": {0, 1},
     "strstr": {0}, "strcasestr": {0}, "strchr": {0}, "strrchr": {0},
 }
-INPUT_FILLERS = {"read": 1, "recv": 1, "recvfrom": 1, "pread": 1, "pread64": 1, "fgets": 0, "gets": 0}
+INPUT_FILLERS = {
+    "read": 1, "recv": 1, "recvfrom": 1, "pread": 1, "pread64": 1,
+    "fgets": 0, "gets": 0,
+    "scanf": 1, "isoc99_scanf": 1, "sscanf": 2, "isoc99_sscanf": 2,
+    "fscanf": 2, "isoc99_fscanf": 2,
+}
 SCANF_FORMAT_INDEX = {
     "scanf": 0, "__isoc99_scanf": 0, "vscanf": 0,
     "sscanf": 1, "__isoc99_sscanf": 1, "vsscanf": 1,
@@ -269,7 +274,7 @@ def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[st
             )
             for guard_pos, guard_from, guard_text in guards.get(function, []):
                 if _call_sort_key(previous) < guard_pos < _call_sort_key(call):
-                    entry += "; guard string %r at %s intervenes between free and use" % (guard_text, guard_from)
+                    entry = "[guarded] " + entry + "; guard string %r at %s intervenes between free and use" % (guard_text, guard_from)
                     break
             use_after_free.append(entry)
             for open_call, path in flag_opens.get(function, []):
@@ -595,6 +600,20 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> List[Finding]:
 
 
 SECCOMP_APIS = {"seccomp", "seccomp_init", "seccomp_rule_add", "prctl"}
+DYNLOAD_APIS = {"LoadLibrary", "LoadLibraryA", "LoadLibraryW", "GetProcAddress", "dlopen", "dlsym"}
+
+
+def _check_dynamic_loading(parsed_imports: set[str]) -> Optional[Finding]:
+    present = sorted(set(parsed_imports) & DYNLOAD_APIS, key=str.lower)
+    if not present:
+        return None
+    return _finding(
+        "PWN-DYNLOAD-001", "Dynamic library/symbol resolution present", "low", "medium",
+        ["parsed import: %s" % name for name in present],
+        "If challenge input can influence the loaded library or resolved symbol name, this is a code-execution or GOT-hijack primitive; otherwise it is benign platform plumbing.",
+        ["Trace the library/symbol name argument to its source.", "Check allowlists on the resolved names."],
+        "Use fixed library paths and validate resolved symbol names against an allowlist.",
+    )
 
 
 def _check_syscall_filter(info: BinaryInfo) -> Optional[Finding]:
@@ -953,6 +972,7 @@ def analyze(info: BinaryInfo) -> List[Finding]:
         _check_file_streams(ghidra_calls),
         _check_command_sinks(parsed_imports, ghidra_calls),
         _check_syscall_filter(info),
+        _check_dynamic_loading(parsed_imports),
         _check_mitigations(info),
     ]
     findings: List[Finding] = [item for item in candidates if item is not None]

@@ -469,3 +469,23 @@ def test_string_addresses_scans_rodata_before_text():
     blob = b"A" * 40 + b"%127s\0"
     result = _elf_string_addresses(blob, [text, rodata], limit=10)
     assert result["%127s"] == [0x2000]
+
+
+def test_macho_stub_sections_map_to_undefined_symbols():
+    # 64-bit Mach-O: LC_SEGMENT_64 __TEXT with one __stubs section (stub size 16),
+    # LC_SYMTAB with one undefined external (_gets).
+    data = bytearray(0x300)
+    struct.pack_into("<IIIIIIII", data, 0, 0xFEEDFACF, 0x01000007, 3, 2, 2, 152, 0, 0)
+    at = 32
+    # LC_SEGMENT_64 __TEXT: vmaddr=0x100000000, initprot=5, nsects=1
+    struct.pack_into("<II16sQQQQIIII", data, at, 0x19, 152, b"__TEXT", 0x100000000, 0x1000, 0, 0x300, 5, 5, 1, 0)
+    # section_64 __stubs: addr=0x100001000, size=16, flags=S_SYMBOL_STUBS(0x08), reserved2=16
+    sect = at + 72
+    struct.pack_into("<16s16sQQIIIIIIII", data, sect, b"__stubs", b"__TEXT", 0x100001000, 16, 0, 0, 0, 0, 0x08, 0, 16, 0)
+    at += 152
+    # LC_SYMTAB: symoff=0x180, nsyms=1, stroff=0x1c0, strsize=8
+    struct.pack_into("<IIIIII", data, at, 0x2, 24, 0x180, 1, 0x1C0, 8)
+    data[0x1C0:0x1C8] = b"\0_gets\0"
+    struct.pack_into("<IBBHQ", data, 0x180, 1, 0x01, 0, 0, 0)  # undefined external _gets
+    info = parse_binary(bytes(data))
+    assert info.metadata["plt_addresses"] == {"0x100001000": "gets"}
