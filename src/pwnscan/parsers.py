@@ -29,8 +29,11 @@ ASCII_RE = re.compile(rb"[\x20-\x7e]{4,}")
 INTERESTING_APIS = (
     "gets", "strcpy", "strcat", "sprintf", "vsprintf", "scanf", "sscanf",
     "fscanf", "read", "recv", "memcpy", "printf", "fprintf", "syslog",
-    "system", "popen", "execve", "mprotect", "VirtualProtect", "WinExec",
-    "CreateProcess", "LoadLibrary", "GetProcAddress",
+    "system", "popen", "execve", "execv", "execvp", "execvpe", "execl",
+    "execlp", "execle", "posix_spawn", "posix_spawnp", "wordexp",
+    "mprotect", "VirtualProtect", "WinExec",
+    "CreateProcess", "LoadLibrary", "GetProcAddress", "dlopen",
+    "prctl", "seccomp", "seccomp_init", "seccomp_rule_add",
     "malloc", "calloc", "realloc", "free", "operator new", "operator delete",
 )
 FORTIFY_APIS = frozenset({
@@ -394,7 +397,7 @@ def _elf_plt_name(data: bytes, endian: str, dynsym: _ElfSection, strings: bytes,
 
 
 def _elf_plt_addresses(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSection], architecture: str) -> Dict[str, str]:
-    if architecture not in {"x86", "x86_64"}:
+    if architecture not in {"x86", "x86_64", "arm", "aarch64"}:
         return {}
     tables = _elf_plt_tables(sections)
     if tables is None:
@@ -404,7 +407,8 @@ def _elf_plt_addresses(data: bytes, bits: int, endian: str, sections: Sequence[_
     if plt is None:
         return {}
     plt_base, first_index = plt
-    plt_stride = plt_base.item_size or 16
+    default_stride = {"arm": 12, "aarch64": 16}.get(architecture, 16)
+    plt_stride = plt_base.item_size or default_stride
     strides = _elf_plt_strides(bits, rel_section, dynsym)
     if strides is None:
         return {}
@@ -439,12 +443,17 @@ def _collect_matches(blob: bytes, needle: bytes, base: int, found: List[int], li
 
 
 def _gadget_patterns(bits: int, architecture: str) -> Dict[str, bytes]:
-    if architecture not in {"x86", "x86_64"}:
-        return {}
-    patterns = {"ret": b"\xc3", "leave_ret": b"\xc9\xc3", "jmp_rsp": b"\xff\xe4", "syscall_ret": b"\x0f\x05\xc3"}
-    if bits == 64:
-        patterns.update({"pop_rdi_ret": b"\x5f\xc3", "pop_rsi_ret": b"\x5e\xc3", "pop_rdx_ret": b"\x5a\xc3"})
-    return patterns
+    if architecture in {"x86", "x86_64"}:
+        patterns = {"ret": b"\xc3", "leave_ret": b"\xc9\xc3", "jmp_rsp": b"\xff\xe4", "syscall_ret": b"\x0f\x05\xc3"}
+        if bits == 64:
+            patterns.update({"pop_rdi_ret": b"\x5f\xc3", "pop_rsi_ret": b"\x5e\xc3", "pop_rdx_ret": b"\x5a\xc3"})
+        return patterns
+    if architecture == "aarch64":
+        # Raw byte sequences; validate against instruction boundaries in a disassembler.
+        return {"ret": b"\xc0\x03\x5f\xd6", "br_x0": b"\x00\x00\x1f\xd6", "blr_x1": b"\x20\x00\x3f\xd6"}
+    if architecture == "arm":
+        return {"bx_lr": b"\x1e\xff\x2f\xe1"}
+    return {}
 
 
 def _scan_section(data: bytes, section: _ElfSection, patterns: Dict[str, bytes], gadgets: Dict[str, List[int]], useful: Dict[str, List[int]]) -> None:
@@ -456,24 +465,29 @@ def _scan_section(data: bytes, section: _ElfSection, patterns: Dict[str, bytes],
         _collect_matches(blob, BIN_SH.encode("ascii") + b"\0", section.va, useful[BIN_SH], 4)
 
 
-def _elf_string_addresses(data: bytes, sections: Sequence[_ElfSection], limit: int = 40000) -> Dict[str, List[int]]:
+def _elf_string_addresses(data: bytes, sections: Sequence[_ElfSection], limit: int = 200000) -> Dict[str, List[int]]:
     """Map each printable string to its virtual addresses, for address-based lookups.
 
     Uses a 2-character minimum so short format strings like "%d" are included;
     lookups are by exact address, so extra entries cannot cause false matches.
+    Non-executable sections are scanned first so a large .text cannot starve
+    .rodata of the global entry budget (format strings live there).
     """
     pattern = re.compile(rb"[\x20-\x7e]{2,}")
     result: Dict[str, List[int]] = {}
     total = 0
-    for section in sections:
+    ordered = sorted(sections, key=lambda section: 1 if section.flags & 4 else 0)
+    for section in ordered:
         if section.kind == 8 or not section.va:
             continue
         blob = data[section.offset:min(len(data), section.offset + section.size)]
         for match in pattern.finditer(blob):
+            if total >= limit:
+                break
             result.setdefault(match.group().decode("ascii", "replace"), []).append(section.va + match.start())
             total += 1
-            if total > limit:
-                break
+        if total >= limit:
+            break
     return {key: sorted(set(values)) for key, values in sorted(result.items())}
 
 

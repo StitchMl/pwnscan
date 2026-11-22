@@ -23,13 +23,20 @@ FORMAT_INDEXES = {
     "sprintf_chk": 3, "vsprintf_chk": 3,
     "snprintf_chk": 4, "vsnprintf_chk": 4,
 }
-COMMAND_SINKS = {"system", "popen", "execve", "WinExec", "CreateProcess"}
+COMMAND_SINKS = {
+    "system", "popen", "execve", "execv", "execvp", "execvpe", "execl", "execlp", "execle",
+    "posix_spawn", "posix_spawnp", "wordexp", "WinExec", "CreateProcess",
+}
 BOUNDED_WRITES = {
-    "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2),
+    "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2), "pread": (1, 2), "pread64": (1, 2),
     "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2), "strncat": (0, 2),
+    "memset": (0, 2), "bzero": (0, 1),
     "fgets": (0, 1), "snprintf": (0, 1),
     "read_chk": (1, 2), "recv_chk": (1, 2), "memcpy_chk": (0, 2), "memmove_chk": (0, 2), "fgets_chk": (0, 2),
 }
+# String writes that do not guarantee NUL termination: a request exactly equal
+# to the capacity leaves no room for the terminator (off-by-one class).
+BOUNDARY_STRING_WRITES = {"strncpy", "strncat"}
 DEALLOCATORS = {"free", "operator delete", "delete"}
 HEAP_DEREFERENCE_ARGUMENTS = {
     "read": {1}, "recv": {1}, "recvfrom": {1}, "write": {1}, "send": {1}, "sendto": {1},
@@ -40,7 +47,7 @@ HEAP_DEREFERENCE_ARGUMENTS = {
     "strcasecmp": {0, 1}, "strncasecmp": {0, 1},
     "strstr": {0}, "strcasestr": {0}, "strchr": {0}, "strrchr": {0},
 }
-INPUT_FILLERS = {"read": 1, "recv": 1, "recvfrom": 1, "fgets": 0, "gets": 0}
+INPUT_FILLERS = {"read": 1, "recv": 1, "recvfrom": 1, "pread": 1, "pread64": 1, "fgets": 0, "gets": 0}
 SCANF_FORMAT_INDEX = {
     "scanf": 0, "__isoc99_scanf": 0, "vscanf": 0,
     "sscanf": 1, "__isoc99_sscanf": 1, "vsscanf": 1,
@@ -277,28 +284,70 @@ def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[st
     )
 
 
+def _fread_requested(call: dict) -> Optional[int]:
+    """fread(ptr, size, nmemb, stream): the byte count is the product of args 1 and 2."""
+
+    size_arg = _call_argument(call, 1)
+    count_arg = _call_argument(call, 2)
+    if size_arg.get("kind") == "constant" and count_arg.get("kind") == "constant":
+        size, count = size_arg.get("value"), count_arg.get("value")
+        if isinstance(size, int) and isinstance(count, int):
+            return size * count
+    return None
+
+
+def _write_capacity(destination: dict) -> Optional[tuple[int, str]]:
+    buffer_size = destination.get("buffer_size")
+    return_offset = destination.get("return_address_offset")
+    if isinstance(buffer_size, int) and buffer_size > 0:
+        return buffer_size, "buffer_size"
+    if isinstance(return_offset, int) and return_offset > 0:
+        return return_offset, "return_address_offset"
+    return None
+
+
 def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
     result = []
     for call in calls:
         name = _call_name(call)
-        if name not in BOUNDED_WRITES:
+        if name == "fread":
+            destination_index, requested = 0, _fread_requested(call)
+        elif name in BOUNDED_WRITES:
+            destination_index, length_index = BOUNDED_WRITES[name]
+            length = _call_argument(call, length_index)
+            requested = length.get("value") if length.get("kind") == "constant" else None
+        else:
+            continue
+        destination = _call_argument(call, destination_index)
+        capacity = _write_capacity(destination)
+        if capacity is None:
+            continue
+        capacity_value, capacity_kind = capacity
+        if isinstance(requested, int) and requested > capacity_value:
+            result.append({
+                "call": call, "name": name, "buffer_size": capacity_value,
+                "capacity_kind": capacity_kind, "requested": requested, "destination": destination,
+            })
+    return result
+
+
+def _boundary_writes(calls: Sequence[dict]) -> list[dict]:
+    """String writes whose request exactly fills the destination (no NUL terminator room)."""
+
+    result = []
+    for call in calls:
+        name = _call_name(call)
+        if name not in BOUNDARY_STRING_WRITES:
             continue
         destination_index, length_index = BOUNDED_WRITES[name]
         destination = _call_argument(call, destination_index)
         length = _call_argument(call, length_index)
-        buffer_size = destination.get("buffer_size")
-        return_offset = destination.get("return_address_offset")
-        if isinstance(buffer_size, int) and buffer_size > 0:
-            capacity, capacity_kind = buffer_size, "buffer_size"
-        elif isinstance(return_offset, int) and return_offset > 0:
-            capacity, capacity_kind = return_offset, "return_address_offset"
-        else:
-            continue
+        capacity = _write_capacity(destination)
         requested = length.get("value") if length.get("kind") == "constant" else None
-        if isinstance(requested, int) and requested > capacity:
+        if capacity is not None and isinstance(requested, int) and requested == capacity[0]:
             result.append({
-                "call": call, "name": name, "buffer_size": capacity,
-                "capacity_kind": capacity_kind, "requested": requested, "destination": destination,
+                "call": call, "name": name, "buffer_size": capacity[0],
+                "capacity_kind": capacity[1], "requested": requested, "destination": destination,
             })
     return result
 
@@ -370,8 +419,26 @@ def _check_bounded_overflows(bounded: Sequence[dict]) -> Optional[Finding]:
     )
 
 
+def _check_boundary_writes(boundary: Sequence[dict]) -> Optional[Finding]:
+    if not boundary:
+        return None
+    evidence = [
+        "Ghidra call %s at %s in %s fills the whole %s (%d bytes) with no room for a NUL terminator"
+        % (item["name"], item["call"].get("from"), item["call"].get("function") or UNKNOWN,
+           item["destination"].get("variable") or "stack destination", item["buffer_size"])
+        for item in boundary
+    ]
+    return _finding(
+        "PWN-BOF-002", "Boundary write leaves no terminator room", "low", "medium", evidence,
+        "If the destination is later treated as a C string (strlen/strcpy/printf %s), the missing terminator reads or copies past the buffer. Confirm the follow-up use in the decompiler before building a payload.",
+        ["Check every consumer of the destination for unbounded string operations."],
+        "Cap string copies at destination size minus one, or terminate explicitly after the copy.",
+    )
+
+
 def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
-    allocation_indexes = {"malloc": {0}, "calloc": {0, 1}, "realloc": {1}, "operator new": {0}, "new": {0}}
+    # calloc is excluded: the allocator checks the count*size product internally.
+    allocation_indexes = {"malloc": {0}, "realloc": {1}, "operator new": {0}, "new": {0}}
     arithmetic_allocations = []
     for call in ghidra_calls:
         name = _call_name(call)
@@ -392,6 +459,36 @@ def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding
         "Drive the reported count or element size toward the integer-width boundary. Confirm allocation wraps smaller than the later initialized element count before deriving a heap-overflow payload.",
         ["Recover operand widths and input bounds in the decompiler.", "Break on the allocator and compare the requested byte count with the following write volume."],
         "Reject operands above SIZE_MAX / element_size before multiplication and above SIZE_MAX - increment before addition.",
+    )
+
+
+DIVISION_OPS = {"INT_DIV", "INT_SDIV", "INT_REM", "INT_SREM"}
+
+
+def _check_division(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+    risky = []
+    for call in ghidra_calls:
+        arguments = call.get("arguments")
+        if not isinstance(arguments, list):
+            continue
+        for index, argument in enumerate(arguments):
+            if not isinstance(argument, dict):
+                continue
+            operations = _expression_ops(argument)
+            if (operations & DIVISION_OPS) and _expression_has_dynamic_input(argument):
+                risky.append((call, index, sorted(operations & DIVISION_OPS)))
+    if not risky:
+        return None
+    evidence = [
+        "Ghidra traces %s argument %d at %s through %s"
+        % (_call_name(call), index, call.get("from"), ", ".join(operations))
+        for call, index, operations in risky
+    ]
+    return _finding(
+        "PWN-INT-002", "Dynamic value reaches a division or modulo", "low", "medium", evidence,
+        "Drive the divisor toward zero or INT_MIN/-1 (signed overflow trap) and observe whether the program crashes or miscomputes a size/offset.",
+        ["Confirm the divisor can be zero or -1 on the reported path."],
+        "Validate the divisor before dividing and use checked arithmetic helpers.",
     )
 
 
@@ -450,8 +547,10 @@ def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
     return findings
 
 
-def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> List[Finding]:
+    findings: List[Finding] = []
     stack_indirect = []
+    loaded_indirect = []
     other_indirect = []
     for call in ghidra_calls:
         if call.get("indirect") is not True:
@@ -465,22 +564,54 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
             call.get("from"), function,
             _argument_identity(target) or target.get("repr") or "not recovered",
         )
-        (stack_indirect if is_stack else other_indirect).append(entry)
+        if is_stack:
+            stack_indirect.append(entry)
+        elif "LOAD" in _expression_ops(target):
+            loaded_indirect.append(entry)
+        else:
+            other_indirect.append(entry)
     if stack_indirect:
-        return _finding(
+        findings.append(_finding(
             "PWN-CFLOW-001", "Stack-derived indirect call target", "high", "high", stack_indirect,
             "Map writes to the reported stack slot. If challenge input controls the full function pointer, redirect it to a compatible fixed success routine or validated gadget.",
             ["Confirm the target slot is writable from challenge input.", "Check the function signature and CFI policy before choosing a destination."],
             "Keep control-flow targets outside writable input buffers and enable CFI or CFG.",
-        )
+        ))
+    if loaded_indirect:
+        findings.append(_finding(
+            "PWN-CFLOW-002", "Indirect call through a memory-loaded pointer (vtable/function-pointer)", "low", "medium", loaded_indirect,
+            "The target was LOADed from memory, i.e. a vtable or function-pointer slot. Trace the object to its last write; continue only if challenge input controls that write (type confusion / vtable overwrite).",
+            ["Identify the owning object/struct and every write to the slot.", "Check whether an overflow or UAF can reach the vtable pointer."],
+            "Validate vtable pointers, protect dispatch tables from untrusted writes, and enable CFI or CFG.",
+        ))
     if other_indirect:
-        return _finding(
+        findings.append(_finding(
             "PWN-CFLOW-001", "Indirect call requires target provenance review", "low", "low", other_indirect,
-            "Trace the recovered function pointer or vtable to its last write. Continue only if challenge input controls that write.",
+            "Trace the recovered function pointer to its last write. Continue only if challenge input controls that write.",
             ["Distinguish normal dispatch from a writable function pointer.", "Inspect all assignments reaching the call."],
             "Protect dispatch tables from untrusted writes and enable CFI or CFG.",
-        )
-    return None
+        ))
+    return findings
+
+
+SECCOMP_APIS = {"seccomp", "seccomp_init", "seccomp_rule_add", "prctl"}
+
+
+def _check_syscall_filter(info: BinaryInfo) -> Optional[Finding]:
+    """Static binaries that install seccomp rules restrict ret2syscall/ROP gadgets."""
+
+    if info.format != "ELF" or info.metadata.get("dynamic") is not False:
+        return None
+    present = sorted(set(info.imports) & SECCOMP_APIS, key=str.lower)
+    if not present:
+        return None
+    return _finding(
+        "PWN-SYSCALL-001", "Syscall filtering may constrain ROP", "info", "medium",
+        ["static binary references: %s" % name for name in present],
+        "If a seccomp filter is installed at runtime, syscall-based gadgets (execve/open/read/write) may be blocked; prefer gadgets that stay within the allowed syscall set.",
+        ["Confirm in a debugger which syscalls the filter allows (SECCOMP_RET_ALLOW vs KILL)."],
+        "Not a vulnerability: keep the filter allowlist minimal and documented.",
+    )
 
 
 def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
@@ -809,19 +940,23 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     symbol_addresses = info.metadata.get("symbol_addresses", {})
     ghidra_calls = info.metadata.get("ghidra", {}).get("calls", [])
     bounded = _bounded_overflows(ghidra_calls)
+    boundary = _boundary_writes(ghidra_calls)
 
     candidates: List[Optional[Finding]] = [
         _check_bounded_overflows(bounded),
+        _check_boundary_writes(boundary),
         _check_integer_allocations(ghidra_calls),
+        _check_division(ghidra_calls),
         _check_width_conversions(ghidra_calls),
-        _check_indirect_calls(ghidra_calls),
         _check_unbounded_writes(info, imports, parsed_imports, string_hints, ghidra_calls),
         _check_format_strings(info, imports, parsed_imports, ghidra_calls),
         _check_file_streams(ghidra_calls),
         _check_command_sinks(parsed_imports, ghidra_calls),
+        _check_syscall_filter(info),
         _check_mitigations(info),
     ]
     findings: List[Finding] = [item for item in candidates if item is not None]
+    findings.extend(_check_indirect_calls(ghidra_calls))
     findings.extend(_check_heap_lifetime(ghidra_calls))
     flag_output, flag_output_path = _flag_output_notes(ghidra_calls)
     findings.extend(_check_win_paths(info, bounded, symbols, symbol_addresses, flag_output, flag_output_path))

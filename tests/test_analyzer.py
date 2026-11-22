@@ -902,3 +902,89 @@ def test_exact_ret2win_withheld_when_canary_presence_unknown():
         ]}},
     ))
     assert not any(item.id == "PWN-FLAG-CHAIN-001" for item in findings)
+
+
+def _dyn_expr(op, dynamic=True):
+    leaf = {"kind": "dynamic", "repr": "(unique, 0x1234, 8)", "size": 8} if dynamic else {"kind": "constant", "value": 8, "size": 8}
+    return {"kind": "dynamic", "repr": "(unique, 0x1230, 8)", "size": 8, "expression": {"op": op, "size": 8, "inputs": [leaf, {"kind": "constant", "value": 4, "size": 8}]}}
+
+
+def test_memset_and_fread_product_overflows_are_proven():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "memset", "arguments": [
+            {"kind": "stack", "stack_offset": -64, "buffer_size": 32, "return_address_offset": 72, "variable": "buf"},
+            {"kind": "constant", "value": 0},
+            {"kind": "constant", "value": 128},
+        ]},
+        {"from": "00401140", "function": "main", "to": "fread", "arguments": [
+            {"kind": "stack", "stack_offset": -64, "buffer_size": 32, "return_address_offset": 72, "variable": "buf"},
+            {"kind": "constant", "value": 16},
+            {"kind": "constant", "value": 8},
+            {"kind": "stack", "stack_offset": -8, "high_name": "stdin"},
+        ]},
+    ]}}))
+    bounds = next(item for item in findings if item.id == "PWN-BOUNDS-001")
+    assert any("memset" in evidence for evidence in bounds.evidence)
+    assert any("fread" in evidence for evidence in bounds.evidence)
+
+
+def test_boundary_strncpy_at_exact_capacity_is_flagged_but_not_overflow():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "strncpy", "arguments": [
+            {"kind": "stack", "stack_offset": -64, "buffer_size": 32, "return_address_offset": 72, "variable": "buf"},
+            {"kind": "stack", "stack_offset": -128, "buffer_size": 64, "variable": "src"},
+            {"kind": "constant", "value": 32},
+        ]},
+    ]}}))
+    assert any(item.id == "PWN-BOF-002" for item in findings)
+    assert not any(item.id == "PWN-BOUNDS-001" for item in findings)
+
+
+def test_calloc_arithmetic_is_not_wrap_prone_but_malloc_is():
+    calls = [
+        {"from": "00401100", "function": "main", "to": "calloc", "arguments": [_dyn_expr("INT_MULT"), _dyn_expr("INT_MULT")]},
+        {"from": "00401140", "function": "main", "to": "malloc", "arguments": [_dyn_expr("INT_MULT")]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    int_finding = next(item for item in findings if item.id == "PWN-INT-001")
+    assert any("malloc" in evidence for evidence in int_finding.evidence)
+    assert not any("calloc" in evidence for evidence in int_finding.evidence)
+
+
+def test_dynamic_division_is_reported_as_low():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": "compute", "arguments": [_dyn_expr("INT_SDIV")]},
+    ]}}))
+    div = next(item for item in findings if item.id == "PWN-INT-002")
+    assert div.severity == "low"
+    assert any("INT_SDIV" in evidence for evidence in div.evidence)
+
+
+def test_exec_family_import_is_a_command_sink_hint():
+    finding = next(item for item in analyze(info(
+        imports=["execvp"], metadata={"parsed_imports": ["execvp"]},
+    )) if item.id == "PWN-CMD-001")
+    assert finding.severity == "low"
+    assert any("execvp" in evidence for evidence in finding.evidence)
+
+
+def test_static_elf_with_seccomp_gets_syscall_filter_note():
+    findings = analyze(info(
+        imports=["seccomp_init"], metadata={"dynamic": False, "parsed_imports": ["seccomp_init"]},
+    ))
+    assert any(item.id == "PWN-SYSCALL-001" for item in findings)
+    dynamic_findings = analyze(info(
+        imports=["seccomp_init"], metadata={"dynamic": True, "parsed_imports": ["seccomp_init"]},
+    ))
+    assert not any(item.id == "PWN-SYSCALL-001" for item in dynamic_findings)
+
+
+def test_indirect_call_with_loaded_target_is_vtable_class():
+    findings = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "main", "to": None, "indirect": True,
+         "target": {"kind": "dynamic", "repr": "(unique, 0x2000, 8)", "size": 8,
+                    "expression": {"op": "LOAD", "size": 8, "inputs": [{"kind": "constant", "value": 0}, {"kind": "dynamic", "repr": "(unique, 0x1ff0, 8)", "size": 8}]}},
+         "arguments": []},
+    ]}}))
+    cflow2 = next(item for item in findings if item.id == "PWN-CFLOW-002")
+    assert cflow2.severity == "low"

@@ -419,3 +419,53 @@ def test_macho_stripped_canary_unknown_unless_symbol_string_present():
     struct.pack_into("<IIIIIIII", with_string, 0, 0xFEEDFACF, 0x01000007, 3, 0, 0, 0, 0, 0)
     with_string[32:32 + 18] = b"___stack_chk_fail\0"
     assert parse_binary(bytes(with_string)).mitigations["stack_canary"] is True
+
+
+def test_elf32_arm_plt_addresses_use_12_byte_stride():
+    data = bytearray(0x400)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x01\x01"  # 32-bit, little-endian
+    data[6] = 1
+    # e_machine=40 (ARM)
+    struct.pack_into("<HHIIIIIHHHHHH", data, 16, 2, 40, 1, 0x8000, 0, 0x200, 0, 52, 0, 0, 40, 6, 5)
+    data[0x100:0x108] = b"\0gets\0\0\0"
+    struct.pack_into("<IIIBBH", data, 0x130, 1, 0, 0, 0x12, 0, 0)
+    struct.pack_into("<II", data, 0x150, 0x22, 1 << 8)  # Elf32_Rel -> sym 1
+    names = b"\0.dynstr\0.dynsym\0.rel.plt\0.plt\0.shstrtab\0"
+    data[0x170:0x170 + len(names)] = names
+    struct.pack_into("<IIIIIIIIII", data, 0x228, 1, 3, 2, 0, 0x100, 8, 0, 0, 1, 0)
+    struct.pack_into("<IIIIIIIIII", data, 0x250, 9, 11, 2, 0, 0x120, 32, 1, 1, 4, 16)
+    struct.pack_into("<IIIIIIIIII", data, 0x278, 17, 9, 2, 0, 0x150, 8, 2, 0, 4, 8)
+    struct.pack_into("<IIIIIIIIII", data, 0x2A0, 26, 1, 6, 0x8300, 0x110, 32, 0, 0, 12, 12)
+    struct.pack_into("<IIIIIIIIII", data, 0x2C8, 31, 3, 0, 0, 0x170, len(names), 0, 0, 1, 0)
+    info = parse_binary(bytes(data))
+    assert info.architecture == "arm"
+    assert info.metadata["plt_addresses"] == {"0x830c": "gets"}
+
+
+def test_aarch64_gadget_byte_patterns():
+    data = bytearray(0x200)
+    data[:4] = b"\x7fELF"
+    data[4:6] = b"\x02\x01"
+    data[6] = 1
+    # e_machine=183 (aarch64)
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 2, 183, 1, 0x400000, 0, 0x100, 0, 64, 0, 0, 64, 3, 2)
+    data[0x100:0x104] = b"\xc0\x03\x5f\xd6"  # ret
+    names = b"\0.text\0.shstrtab\0"
+    data[0x180:0x180 + len(names)] = names
+    struct.pack_into("<IIQQQQIIQQ", data, 0x140, 1, 1, 6, 0x400100, 0x100, 4, 0, 0, 1, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 0x180 - 64 + 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # placeholder overwritten below
+    struct.pack_into("<IIQQQQIIQQ", data, 0x1C0, 6, 3, 0, 0, 0x180, len(names), 0, 0, 1, 0)
+    info = parse_binary(bytes(data))
+    assert info.architecture == "aarch64"
+    assert info.metadata["gadgets"]["ret"] == [0x400100]
+
+
+def test_string_addresses_scans_rodata_before_text():
+    from pwnscan.parsers import _elf_string_addresses, _ElfSection
+
+    text = _ElfSection(".text", 1, 6, 0x1000, 0, 40, 0, 0)      # executable, scanned last
+    rodata = _ElfSection(".rodata", 1, 2, 0x2000, 40, 8, 0, 0)   # read-only, scanned first
+    blob = b"A" * 40 + b"%127s\0"
+    result = _elf_string_addresses(blob, [text, rodata], limit=10)
+    assert result["%127s"] == [0x2000]
