@@ -604,3 +604,96 @@ def test_strcmp_before_free_is_not_reported_as_uaf():
         {"from": "00101f71", "function": "challenge", "to": "free", "arguments": [pointer]},
     ]}}))
     assert not any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_ghidra_fun_label_resolves_from_elf_plt_addresses_nonpie(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "functions": [{"name": "main", "entry": "004012d6"}],
+        "imports": ["EXTERNAL::__isoc99_scanf"],
+        "calls": [{
+            "from": "004013ee",
+            "function": "main",
+            "to": "FUN_004011e0",
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x4011e0, 8)", "size": 8},
+            "arguments": [
+                {"kind": "address_constant", "string": "%127s", "address": "00402104", "writable": False},
+                {"kind": "stack", "stack_offset": -152, "return_address_offset": 152},
+            ],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x4011e0": "__isoc99_scanf"}}), export)
+    calls = merged.metadata["ghidra"]["calls"]
+    assert calls[0]["to"] == "__isoc99_scanf"
+    assert not any(item.id == "PWN-BOF-001" for item in analyze(merged))
+
+
+def test_ghidra_fun_label_resolves_with_pie_image_base(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "pie_export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "image_base": "00100000",
+        "functions": [{"name": "main", "entry": "00101200"}],
+        "imports": ["EXTERNAL::free@GLIBC_2.2.5"],
+        "calls": [{
+            "from": "00101731",
+            "function": "main",
+            "to": "FUN_00101110",
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x101110, 8)", "size": 8},
+            "arguments": [dynamic("ptr")],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x1110": "free"}}), export)
+    assert merged.metadata["ghidra"]["calls"][0]["to"] == "free"
+    assert merged.metadata["parsed_imports"] == ["free"]
+
+
+def test_ghidra_fun_label_without_plt_mapping_is_left_untouched(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "functions": [{"name": "main", "entry": "00401200"}],
+        "imports": ["EXTERNAL::__isoc99_scanf"],
+        "calls": [{
+            "from": "00401300",
+            "function": "main",
+            "to": "FUN_00401999",
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x401999, 8)", "size": 8},
+            "arguments": [{"kind": "stack", "stack_offset": -64}],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x4011e0": "__isoc99_scanf"}}), export)
+    assert merged.metadata["ghidra"]["calls"][0]["to"] == "FUN_00401999"
+    bof = next(item for item in analyze(merged) if item.id == "PWN-BOF-001")
+    assert any("__isoc99_scanf" in reason for reason in bof.evidence)
+
+
+def test_named_ghidra_call_target_is_never_rewritten_by_plt_map(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "functions": [{"name": "main", "entry": "00401200"}],
+        "imports": ["EXTERNAL::puts"],
+        "calls": [{
+            "from": "00401300",
+            "function": "main",
+            "to": "puts",
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x401130, 8)", "size": 8},
+            "arguments": [{"kind": "address_constant", "string": "hi", "address": "00402000", "writable": False}],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(metadata={"plt_addresses": {"0x401130": "printf"}}), export)
+    assert merged.metadata["ghidra"]["calls"][0]["to"] == "puts"

@@ -741,26 +741,39 @@ def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
     return ScanReport("pwnscan/v1", target, hashlib.sha256(data).hexdigest(), len(data), info, analyze(info))
 
 
-def _resolve_call_target(call: dict, plt_addresses: dict, ghidra_base: int) -> None:
+_AUTO_LABEL_RE = re.compile(r"^(?:FUN|DAT|LAB|SUB|EXT)_([0-9a-fA-F]+)$")
+
+
+def _resolve_candidate_addresses(call: dict, ghidra_base: int) -> List[int]:
+    candidates: List[int] = []
     current_to = call.get("to")
-    if current_to and not (isinstance(current_to, str) and current_to.startswith(("DAT_", "LAB_"))):
-        return
+    if isinstance(current_to, str):
+        match = _AUTO_LABEL_RE.match(current_to)
+        if match:
+            candidates.append(int(match.group(1), 16))
     target = call.get("target")
     repr_text = target.get("repr") if isinstance(target, dict) else None
-    if not isinstance(repr_text, str):
+    if isinstance(repr_text, str):
+        match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
+        if match:
+            candidates.append(int(match.group(1), 16))
+    addresses: List[int] = []
+    for addr in candidates:
+        addresses.append(addr)
+        if ghidra_base and addr >= ghidra_base:
+            addresses.append(addr - ghidra_base)
+    return addresses
+
+
+def _resolve_call_target(call: dict, plt_addresses: dict, ghidra_base: int) -> None:
+    current_to = call.get("to")
+    if isinstance(current_to, str) and current_to and not _AUTO_LABEL_RE.match(current_to):
         return
-    match = re.search(r"\(ram,\s*0x([0-9a-fA-F]+)", repr_text)
-    if not match:
-        return
-    addr = int(match.group(1), 16)
-    candidates = [addr]
-    if ghidra_base and addr >= ghidra_base:
-        candidates.append(addr - ghidra_base)
-    for candidate in candidates:
-        addr_key = "0x%x" % candidate
+    for addr in _resolve_candidate_addresses(call, ghidra_base):
+        addr_key = "0x%x" % addr
         if addr_key in plt_addresses:
             call["to"] = plt_addresses[addr_key]
-            break
+            return
 
 
 def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict, ghidra_base: int = 0) -> List[dict]:
