@@ -791,3 +791,63 @@ def test_no_flag_open_no_output_note():
         ]},
     ]}}))
     assert not any(item.id == "PWN-WIN-001" for item in findings)
+
+
+def test_merge_ghidra_recovers_format_string_from_elf_string_addresses(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "image_base": "00100000",
+        "functions": [{"name": "main", "entry": "00101200"}],
+        "imports": ["EXTERNAL::__isoc99_scanf"],
+        "calls": [{
+            "from": "0010143e",
+            "function": "main",
+            "to": None,
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x1011d0, 8)", "size": 8},
+            "arguments": [
+                {"kind": "address_constant", "address": "00102129", "writable": False},
+                {"kind": "stack", "stack_offset": -152, "return_address_offset": 152},
+            ],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(
+        info(metadata={
+            "plt_addresses": {"0x11d0": "__isoc99_scanf"},
+            "string_addresses": {"%127s": [0x2129]},
+        }),
+        export,
+    )
+    call = merged.metadata["ghidra"]["calls"][0]
+    assert call["to"] == "__isoc99_scanf"
+    assert call["arguments"][0]["string"] == "%127s"
+    assert not any(item.id == "PWN-BOF-001" for item in analyze(merged))
+
+
+def test_merge_ghidra_without_string_addresses_keeps_unbounded_scanf(tmp_path):
+    from pwnscan.analyzer import _merge_ghidra
+
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "schema": "pwnscan-ghidra/v1",
+        "image_base": "00100000",
+        "functions": [{"name": "main", "entry": "00101200"}],
+        "imports": ["EXTERNAL::__isoc99_scanf"],
+        "calls": [{
+            "from": "0010143e",
+            "function": "main",
+            "to": "__isoc99_scanf",
+            "indirect": False,
+            "target": {"kind": "dynamic", "repr": "(ram, 0x1011d0, 8)", "size": 8},
+            "arguments": [
+                {"kind": "address_constant", "address": "00102129", "writable": False},
+                {"kind": "stack", "stack_offset": -152, "return_address_offset": 152},
+            ],
+        }],
+    }), encoding="utf-8")
+    merged = _merge_ghidra(info(), export)
+    assert "string" not in merged.metadata["ghidra"]["calls"][0]["arguments"][0]
+    assert any(item.id == "PWN-BOF-001" for item in analyze(merged))

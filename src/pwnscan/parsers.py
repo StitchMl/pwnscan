@@ -249,6 +249,7 @@ def parse_elf(data: bytes) -> BinaryInfo:
             "parsed_imports": parsed_imports, "fortified_imports": fortified_imports, "string_import_hints": string_hints,
             "symbol_addresses": symbol_addresses,
             "plt_addresses": plt_addresses,
+            "string_addresses": _elf_string_addresses(data, sections),
             **_elf_exploit_metadata(data, bits, sections, architecture),
         },
     )
@@ -448,6 +449,27 @@ def _scan_section(data: bytes, section: _ElfSection, patterns: Dict[str, bytes],
             _collect_matches(blob, needle, section.va, gadgets[label], 8)
     if section.flags & 2 or section.va:
         _collect_matches(blob, BIN_SH.encode("ascii") + b"\0", section.va, useful[BIN_SH], 4)
+
+
+def _elf_string_addresses(data: bytes, sections: Sequence[_ElfSection], limit: int = 40000) -> Dict[str, List[int]]:
+    """Map each printable string to its virtual addresses, for address-based lookups.
+
+    Uses a 2-character minimum so short format strings like "%d" are included;
+    lookups are by exact address, so extra entries cannot cause false matches.
+    """
+    pattern = re.compile(rb"[\x20-\x7e]{2,}")
+    result: Dict[str, List[int]] = {}
+    total = 0
+    for section in sections:
+        if section.kind == 8 or not section.va:
+            continue
+        blob = data[section.offset:min(len(data), section.offset + section.size)]
+        for match in pattern.finditer(blob):
+            result.setdefault(match.group().decode("ascii", "replace"), []).append(section.va + match.start())
+            total += 1
+            if total > limit:
+                break
+    return {key: sorted(set(values)) for key, values in sorted(result.items())}
 
 
 def _elf_exploit_metadata(data: bytes, bits: int, sections: Sequence[_ElfSection], architecture: str) -> Dict[str, object]:

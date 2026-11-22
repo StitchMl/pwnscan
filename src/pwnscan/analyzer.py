@@ -918,10 +918,38 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
             ghidra_base = int(payload["image_base"], 16)
         except ValueError:
             ghidra_base = 0
+    resolved_calls = _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base)
+    string_addresses = metadata.get("string_addresses")
+    if isinstance(string_addresses, dict) and string_addresses:
+        address_to_string: dict[int, str] = {}
+        for text, addresses in string_addresses.items():
+            if isinstance(text, str) and isinstance(addresses, list):
+                for address in addresses:
+                    if isinstance(address, int):
+                        address_to_string[address] = text
+        for call in resolved_calls:
+            arguments = call.get("arguments")
+            if not isinstance(arguments, list):
+                continue
+            for argument in arguments:
+                if not isinstance(argument, dict) or argument.get("kind") != "address_constant" or argument.get("string"):
+                    continue
+                raw_address = argument.get("address")
+                try:
+                    address = int(str(raw_address), 16)
+                except (TypeError, ValueError):
+                    continue
+                candidates = [address]
+                if ghidra_base and address >= ghidra_base:
+                    candidates.append(address - ghidra_base)
+                for candidate in candidates:
+                    if candidate in address_to_string:
+                        argument["string"] = address_to_string[candidate]
+                        break
     metadata["ghidra"] = {
         "language": payload.get("language"),
         "image_base": payload.get("image_base"),
-        "calls": _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base),
+        "calls": resolved_calls,
     }
     metadata["parsed_imports"] = sorted(set(metadata.get("parsed_imports", [])) | clean_imports, key=str.lower)
     return BinaryInfo(
