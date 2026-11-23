@@ -10,6 +10,7 @@ from .model import BinaryInfo, Finding, ScanReport
 from .parsers import parse_binary
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 UNBOUNDED_FORMAT = "may use an unbounded %s"
 UNKNOWN = "<unknown>"
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": UNBOUNDED_FORMAT, "sscanf": UNBOUNDED_FORMAT, "fscanf": UNBOUNDED_FORMAT, "__isoc99_scanf": UNBOUNDED_FORMAT, "__isoc99_sscanf": UNBOUNDED_FORMAT, "__isoc99_fscanf": UNBOUNDED_FORMAT}
@@ -125,7 +126,18 @@ for _names in (FORMAT_SINKS, COMMAND_SINKS, VARARG_COMMAND_SINKS, DEALLOCATORS, 
 
 
 def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = "Manual confirmation required before a flag-recovery payload exists.") -> Finding:
-    return Finding(identity, title, severity, confidence, sorted(set(evidence), key=str.lower), vector, list(validation), patch, exploit_status, flag_path)
+    return Finding(
+        identity,
+        title,
+        severity,
+        confidence,
+        sorted(set(evidence), key=lambda item: (item.startswith("[guarded] "), item.lower())),
+        vector,
+        list(validation),
+        patch,
+        exploit_status,
+        flag_path,
+    )
 
 
 def _call_name(call: dict) -> str:
@@ -192,6 +204,9 @@ def _expression_has_dynamic_input(argument: dict) -> bool:
     return not saw_leaf and _dynamic_argument(argument)
 
 
+_RAM_RE = re.compile(r"\(ram,\s*(0x[0-9a-fA-F]+),\s*\d+\)")
+
+
 def _argument_identity(argument: dict) -> str | None:
     high_name = argument.get("high_name")
     if isinstance(high_name, str) and high_name and high_name not in {"UNNAMED", "null"}:
@@ -205,6 +220,75 @@ def _argument_identity(argument: dict) -> str | None:
     return None
 
 
+def _global_identity(argument: dict) -> str | None:
+    """Recover a stable global/BSS address identity when a pointer is loaded from or refers to static writable memory."""
+    if not isinstance(argument, dict):
+        return None
+    if argument.get("kind") == "address_constant" and argument.get("writable") is True and argument.get("address"):
+        return "global:%s" % str(argument["address"]).lower()
+    repr_text = argument.get("repr")
+    if isinstance(repr_text, str):
+        match = _RAM_RE.search(repr_text)
+        if match:
+            return "global:%s" % match.group(1).lower()
+    expr = argument.get("expression")
+    if isinstance(expr, dict):
+        pending = [expr]
+        seen: set[int] = set()
+        while pending:
+            node = pending.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            op = node.get("op")
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), list) else []
+            if op == "LOAD" and len(inputs) >= 2:
+                ptr = inputs[1]
+                if isinstance(ptr, dict):
+                    if ptr.get("kind") == "address_constant" and ptr.get("address"):
+                        return "global:%s" % str(ptr["address"]).lower()
+                    if ptr.get("kind") == "constant" and isinstance(ptr.get("value"), int):
+                        return "global:0x%x" % ptr["value"]
+                    ptr_repr = ptr.get("repr")
+                    if isinstance(ptr_repr, str):
+                        match = _RAM_RE.search(ptr_repr)
+                        if match:
+                            return "global:%s" % match.group(1).lower()
+            for inp in inputs:
+                if isinstance(inp, dict):
+                    nested = inp.get("expression")
+                    if isinstance(nested, dict):
+                        pending.append(nested)
+    return None
+
+
+def _can_reach_call(cfg: dict, function: str, src: dict, dst: dict) -> bool:
+    """Return True if dst is reachable from src according to CFG (or address order if CFG is unavailable)."""
+    fn_cfg = cfg.get(function) if isinstance(cfg, dict) else None
+    blocks = fn_cfg.get("blocks") if isinstance(fn_cfg, dict) else None
+    src_block = src.get("block")
+    dst_block = dst.get("block")
+    if isinstance(blocks, dict) and isinstance(src_block, int) and isinstance(dst_block, int):
+        if src_block == dst_block:
+            src_key = (src.get("order", _call_sort_key(src)), _call_sort_key(src))
+            dst_key = (dst.get("order", _call_sort_key(dst)), _call_sort_key(dst))
+            return src_key < dst_key
+        visited: set[int] = {src_block}
+        queue: list[int] = [src_block]
+        while queue:
+            current = queue.pop(0)
+            for nxt in blocks.get(str(current), []):
+                if not isinstance(nxt, int):
+                    continue
+                if nxt == dst_block:
+                    return True
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        return False
+    return _call_sort_key(src) < _call_sort_key(dst)
+
+
 def _call_position(call: dict) -> tuple[str, int, str]:
     value = str(call.get("from") or "")
     try:
@@ -214,19 +298,29 @@ def _call_position(call: dict) -> tuple[str, int, str]:
     return str(call.get("function") or ""), numeric, value
 
 
-def _record_free(call: dict, function: str, freed: dict, double_free: list) -> None:
-    identity = _argument_identity(_call_argument(call, 0))
-    if identity is None:
-        return
-    key = function, identity
-    previous = freed.get(key)
-    if previous is not None:
-        double_free.append(
-            "%s frees %s at %s after an earlier free at %s"
-            % (function, identity, call.get("from"), previous.get("from"))
-        )
-    else:
-        freed[key] = call
+def _record_free(call: dict, function: str, freed: dict, double_free: list, cfg: dict, global_freed: dict) -> None:
+    arg0 = _call_argument(call, 0)
+    identity = _argument_identity(arg0)
+    if identity is not None:
+        key = function, identity
+        previous = freed.get(key)
+        if previous is not None and _can_reach_call(cfg, function, previous, call):
+            double_free.append(
+                "%s frees %s at %s after an earlier free at %s"
+                % (function, identity, call.get("from"), previous.get("from"))
+            )
+        elif previous is None:
+            freed[key] = call
+    global_id = _global_identity(arg0)
+    if global_id is not None:
+        prev_globals = global_freed.setdefault(global_id, [])
+        for prev_fn, prev_call in prev_globals:
+            if prev_fn != function:
+                double_free.append(
+                    "%s frees global %s at %s (also freed in %s at %s)"
+                    % (function, global_id, call.get("from"), prev_fn, prev_call.get("from"))
+                )
+        prev_globals.append((function, call))
 
 
 def _call_sort_key(call: dict) -> int:
@@ -246,8 +340,8 @@ def _flag_open_calls(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]
     return result
 
 
-def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[int, str, str]]]:
-    result: dict[str, list[tuple[int, str, str]]] = {}
+def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]:
+    result: dict[str, list[tuple[dict, str]]] = {}
     for call in calls:
         if _call_name(call) not in OUTPUT_STRING_NAMES:
             continue
@@ -255,15 +349,20 @@ def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[int, str, str]
         text = argument.get("string") if argument.get("kind") == "address_constant" else None
         if isinstance(text, str) and text and GUARD_TEXT.search(text):
             function = str(call.get("function") or UNKNOWN)
-            result.setdefault(function, []).append((_call_sort_key(call), str(call.get("from") or ""), text))
+            result.setdefault(function, []).append((call, text))
     return result
 
 
-def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[str], list[str]]:
+ALLOCATORS = {"malloc", "calloc", "realloc", "aligned_alloc", "memalign", "posix_memalign", "strdup", "strndup", "operator new", "operator new[]", "new"}
+
+
+def _heap_lifetime_candidates(calls: Sequence[dict], cfg: dict | None = None) -> tuple[list[str], list[str], list[str]]:
+    cfg_map = cfg if isinstance(cfg, dict) else {}
     double_free: list[str] = []
     use_after_free: list[str] = []
     flag_notes: list[str] = []
     freed: dict[tuple[str, str], dict] = {}
+    global_freed: dict[str, list[tuple[str, dict]]] = {}
     ordered = sorted(calls, key=_call_position)
     guards = _guard_strings(ordered)
     flag_opens = _flag_open_calls(ordered)
@@ -271,30 +370,48 @@ def _heap_lifetime_candidates(calls: Sequence[dict]) -> tuple[list[str], list[st
         function = str(call.get("function") or UNKNOWN)
         name = _call_name(call)
         if name in DEALLOCATORS:
-            _record_free(call, function, freed, double_free)
+            _record_free(call, function, freed, double_free, cfg_map, global_freed)
             continue
         indexes = HEAP_DEREFERENCE_ARGUMENTS.get(name, set())
         for index in indexes:
-            identity = _argument_identity(_call_argument(call, index))
+            arg = _call_argument(call, index)
+            identity = _argument_identity(arg)
             previous = freed.get((function, identity or ""))
-            if previous is None:
-                continue
-            entry = "%s passes freed %s to %s argument %d at %s; free at %s" % (
-                function, identity, name, index, call.get("from"), previous.get("from"),
-            )
-            for guard_pos, guard_from, guard_text in guards.get(function, []):
-                if _call_sort_key(previous) < guard_pos < _call_sort_key(call):
-                    entry = "[guarded] " + entry + "; guard string %r at %s intervenes between free and use" % (guard_text, guard_from)
-                    break
-            use_after_free.append(entry)
-            for open_call, path in flag_opens.get(function, []):
-                flag_notes.append(
-                    "flag file %r opened at %s in %s; buffer %s freed at %s and reused by %s at %s may alias the flag buffer"
-                    % (path, open_call.get("from"), function, identity, previous.get("from"), name, call.get("from"))
+            if previous is not None and _can_reach_call(cfg_map, function, previous, call):
+                entry = "%s passes freed %s to %s argument %d at %s; free at %s" % (
+                    function, identity, name, index, call.get("from"), previous.get("from"),
                 )
+                for guard_call, guard_text in guards.get(function, []):
+                    if _can_reach_call(cfg_map, function, previous, guard_call) and _can_reach_call(cfg_map, function, guard_call, call):
+                        entry = "[guarded] " + entry + "; guard string %r at %s intervenes between free and use" % (guard_text, guard_call.get("from"))
+                        break
+                use_after_free.append(entry)
+                for open_call, path in flag_opens.get(function, []):
+                    flag_notes.append(
+                        "flag file %r opened at %s in %s; buffer %s freed at %s and reused by %s at %s may alias the flag buffer"
+                        % (path, open_call.get("from"), function, identity, previous.get("from"), name, call.get("from"))
+                    )
+            global_id = _global_identity(arg)
+            if global_id is not None:
+                for free_fn, free_call in global_freed.get(global_id, []):
+                    if free_fn != function:
+                        use_after_free.append(
+                            "%s passes global %s (freed in %s at %s) to %s argument %d at %s"
+                            % (function, global_id, free_fn, free_call.get("from"), name, index, call.get("from"))
+                        )
+        if name in ALLOCATORS:
+            reassigned = _return_var_identities(call)
+            if name == "posix_memalign":
+                out_id = _argument_identity(_call_argument(call, 0))
+                if out_id:
+                    reassigned.add(out_id)
+            for rid in reassigned:
+                prev_free = freed.get((function, rid))
+                if prev_free is not None and _can_reach_call(cfg_map, function, prev_free, call):
+                    del freed[(function, rid)]
     return (
         sorted(set(double_free), key=str.lower),
-        sorted(set(use_after_free), key=str.lower),
+        sorted(set(use_after_free), key=lambda item: (item.startswith("[guarded] "), item.lower())),
         sorted(set(flag_notes), key=str.lower),
     )
 
@@ -453,7 +570,56 @@ def _check_boundary_writes(boundary: Sequence[dict]) -> Optional[Finding]:
     )
 
 
-def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+BOUNDS_GUARD_OPS = {"INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL"}
+
+
+def _block_can_reach(blocks: dict, src_block: int, dst_block: int) -> bool:
+    if src_block == dst_block:
+        return True
+    visited: set[int] = {src_block}
+    queue: list[int] = [src_block]
+    while queue:
+        current = queue.pop(0)
+        for nxt in blocks.get(str(current), []):
+            if not isinstance(nxt, int):
+                continue
+            if nxt == dst_block:
+                return True
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append(nxt)
+    return False
+
+
+def _has_bounds_guard(cfg: dict | None, call: dict, argument: dict) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    function = str(call.get("function") or UNKNOWN)
+    fn_cfg = cfg.get(function)
+    call_block = call.get("block")
+    if not isinstance(fn_cfg, dict) or not isinstance(call_block, int):
+        return False
+    blocks = fn_cfg.get("blocks")
+    guards = fn_cfg.get("guards")
+    if not isinstance(blocks, dict) or not isinstance(guards, list):
+        return False
+    arg_ids = _argument_identities_in_tree(argument)
+    if not arg_ids:
+        return False
+    for guard in guards:
+        if not isinstance(guard, dict):
+            continue
+        if guard.get("op") not in BOUNDS_GUARD_OPS:
+            continue
+        if guard.get("var") not in arg_ids:
+            continue
+        guard_block = guard.get("block")
+        if isinstance(guard_block, int) and guard_block != call_block and _block_can_reach(blocks, guard_block, call_block):
+            return True
+    return False
+
+
+def _check_integer_allocations(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
     # calloc is excluded: the allocator checks the count*size product internally.
     allocation_indexes = {
         "malloc": {0}, "realloc": {1}, "aligned_alloc": {1},
@@ -467,6 +633,8 @@ def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding
             argument = _call_argument(call, index)
             operations = _expression_ops(argument)
             if (operations & ARITHMETIC_WRAP_OPS) and _expression_has_dynamic_input(argument):
+                if _has_bounds_guard(cfg, call, argument):
+                    continue
                 arithmetic_allocations.append((call, index, sorted(operations & ARITHMETIC_WRAP_OPS)))
     if not arithmetic_allocations:
         return None
@@ -513,7 +681,7 @@ def _check_division(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     )
 
 
-def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+def _check_width_conversions(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
     width_changed_lengths = []
     for call in ghidra_calls:
         name = _call_name(call)
@@ -527,6 +695,8 @@ def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
             argument = _call_argument(call, length_index)
             operations = _expression_ops(argument)
             if (operations & WIDTH_CHANGE_OPS) and _expression_has_dynamic_input(argument):
+                if _has_bounds_guard(cfg, call, argument):
+                    continue
                 width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
     if not width_changed_lengths:
         return None
@@ -543,9 +713,97 @@ def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     )
 
 
-def _check_heap_lifetime(ghidra_calls: Sequence[dict]) -> List[Finding]:
+SNPRINTF_NAMES = {"snprintf", "vsnprintf", "snprintf_chk", "vsnprintf_chk"}
+SNPRINTF_LENGTH_SINKS = {
+    "read": (2,), "recv": (2,), "recvfrom": (2,), "pread": (2,), "pread64": (2,),
+    "write": (2,), "pwrite": (2,), "send": (2,), "sendto": (2,),
+    "memcpy": (2,), "memmove": (2,), "strncpy": (2,), "strncat": (2,), "memset": (2,),
+    "bzero": (1,), "fgets": (1,), "snprintf": (1,), "vsnprintf": (1,),
+    "malloc": (0,), "realloc": (1,), "alloca": (0,),
+}
+
+
+def _return_var_identities(call: dict) -> set[str]:
+    ret = call.get("return_var")
+    if not isinstance(ret, dict):
+        return set()
+    ids: set[str] = set()
+    high_name = ret.get("high_name")
+    if isinstance(high_name, str) and high_name and high_name not in {"UNNAMED", "null"}:
+        ids.add("high:%s" % high_name)
+    repr_text = ret.get("repr")
+    if isinstance(repr_text, str) and repr_text:
+        ids.add("repr:%s" % repr_text)
+    return ids
+
+
+def _argument_identities_in_tree(argument: dict) -> set[str]:
+    ids: set[str] = set()
+    direct = _argument_identity(argument)
+    if direct:
+        ids.add(direct)
+    expr = argument.get("expression")
+    if not isinstance(expr, dict):
+        return ids
+    pending = [expr]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for inp in node.get("inputs", []):
+            if not isinstance(inp, dict):
+                continue
+            inp_id = _argument_identity(inp)
+            if inp_id:
+                ids.add(inp_id)
+            nested = inp.get("expression")
+            if isinstance(nested, dict):
+                pending.append(nested)
+    return ids
+
+
+def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
+    """Detect snprintf/vsnprintf return values reused as lengths, offsets, or allocation sizes."""
+    cfg_map = cfg if isinstance(cfg, dict) else {}
+    ordered = sorted(ghidra_calls, key=_call_position)
+    producers: dict[str, list[tuple[dict, set[str]]]] = {}
+    hits: list[str] = []
+    for call in ordered:
+        function = str(call.get("function") or UNKNOWN)
+        name = _call_name(call)
+        sink_indexes = SNPRINTF_LENGTH_SINKS.get(name, ())
+        for idx in sink_indexes:
+            arg = _call_argument(call, idx)
+            arg_ids = _argument_identities_in_tree(arg)
+            if not arg_ids:
+                continue
+            for prod_call, prod_ids in producers.get(function, []):
+                if (arg_ids & prod_ids) and _can_reach_call(cfg_map, function, prod_call, call):
+                    hits.append(
+                        "%s passes %s return value from %s to %s argument %d at %s"
+                        % (function, _call_name(prod_call), prod_call.get("from"), name, idx, call.get("from"))
+                    )
+                    break
+        if name in SNPRINTF_NAMES:
+            ret_ids = _return_var_identities(call)
+            if ret_ids:
+                producers.setdefault(function, []).append((call, ret_ids))
+    if not hits:
+        return None
+    return _finding(
+        "PWN-INT-003", "snprintf return value used as a length or offset", "medium", "high",
+        sorted(set(hits), key=str.lower),
+        "snprintf/vsnprintf returns the untruncated byte count that would have been written, not the actual bytes written. When truncated, feeding this return value into subsequent length/size calculations can underflow remaining capacity or cause an out-of-bounds read/write.",
+        ["Check whether the snprintf call can be truncated by user input.", "Inspect the subsequent length or pointer arithmetic for wrap/underflow."],
+        "Clamp the return value of snprintf to the buffer size (or check `ret < 0 || (size_t)ret >= size`) before using it as an offset or length.",
+    )
+
+
+def _check_heap_lifetime(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> List[Finding]:
     findings: List[Finding] = []
-    double_free, use_after_free, flag_notes = _heap_lifetime_candidates(ghidra_calls)
+    double_free, use_after_free, flag_notes = _heap_lifetime_candidates(ghidra_calls, cfg)
     if double_free:
         findings.append(_finding(
             "PWN-HEAP-001", "Repeated free of the same recovered pointer", "high", "medium", double_free,
@@ -611,7 +869,7 @@ def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> List[Finding]:
         ))
     if other_indirect:
         findings.append(_finding(
-            "PWN-CFLOW-001", "Indirect call requires target provenance review", "low", "low", other_indirect,
+            "PWN-CFLOW-003", "Indirect call requires target provenance review", "low", "low", other_indirect,
             "Trace the recovered function pointer to its last write. Continue only if challenge input controls that write.",
             ["Distinguish normal dispatch from a writable function pointer.", "Inspect all assignments reaching the call."],
             "Protect dispatch tables from untrusted writes and enable CFI or CFG.",
@@ -697,8 +955,9 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
         return None
     dangerous_set = set(dangerous) | {_strip_underscores(name) for name in dangerous}
     proven = sorted(dangerous_set & parsed_imports, key=str.lower)
-    hints = sorted(dangerous_set & string_hints, key=str.lower)
     callsites = [item for item in ghidra_calls if _call_name(item) in dangerous_set]
+    resolved_names = set(proven) | {_call_name(item) for item in callsites}
+    hints = sorted((dangerous_set & string_hints) - resolved_names, key=str.lower)
     reasons = (
         ["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven]
         + ["unverified string hint: %s" % name for name in hints]
@@ -946,10 +1205,12 @@ def _is_file_stream_argument(argument: dict, function: str, local_streams: set[t
     return isinstance(repr_text, str) and ("repr:%s" % repr_text) in global_streams
 
 
-def _check_file_streams(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+def _check_file_streams(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
+    cfg_map = cfg if isinstance(cfg, dict) else {}
     local_streams, global_streams = _collect_file_stream_identities(ghidra_calls)
     evidence: list[str] = []
     closed: dict[tuple[str, str], dict] = {}
+    global_closed: dict[str, list[tuple[str, dict]]] = {}
     for call in sorted(ghidra_calls, key=_call_position):
         name = _call_name(call)
         function = str(call.get("function") or UNKNOWN)
@@ -959,15 +1220,25 @@ def _check_file_streams(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
                 label = dst.get("high_name") if dst.get("high_name") not in {None, "UNNAMED", "null"} else (_argument_identity(dst) or "FILE*")
                 evidence.append("Ghidra call %s at %s in %s writes into FILE stream %s" % (name, call.get("from"), function, label))
         if name == "fclose":
-            identity = _argument_identity(_call_argument(call, 0))
+            arg0 = _call_argument(call, 0)
+            identity = _argument_identity(arg0)
             if identity is not None:
                 closed.setdefault((function, identity), call)
+            global_id = _global_identity(arg0)
+            if global_id is not None:
+                global_closed.setdefault(global_id, []).append((function, call))
         elif name in FILE_STREAM_ARGS and name not in {"setbuf", "setvbuf"}:
             for index in FILE_STREAM_ARGS[name]:
-                identity = _argument_identity(_call_argument(call, index))
+                arg = _call_argument(call, index)
+                identity = _argument_identity(arg)
                 previous = closed.get((function, identity or ""))
-                if previous is not None:
+                if previous is not None and _can_reach_call(cfg_map, function, previous, call):
                     evidence.append("%s uses FILE stream %s in %s at %s after fclose at %s" % (name, identity, function, call.get("from"), previous.get("from")))
+                global_id = _global_identity(arg)
+                if global_id is not None:
+                    for close_fn, close_call in global_closed.get(global_id, []):
+                        if close_fn != function:
+                            evidence.append("%s uses global FILE stream %s in %s at %s (closed in %s at %s)" % (name, global_id, function, call.get("from"), close_fn, close_call.get("from")))
     if not evidence:
         return None
     return _finding(
@@ -984,19 +1255,22 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     parsed_imports = set(info.metadata.get("parsed_imports", []))
     string_hints = set(info.metadata.get("string_import_hints", []))
     symbol_addresses = info.metadata.get("symbol_addresses", {})
-    ghidra_calls = info.metadata.get("ghidra", {}).get("calls", [])
+    ghidra_data = info.metadata.get("ghidra", {})
+    ghidra_calls = ghidra_data.get("calls", [])
+    ghidra_cfg = ghidra_data.get("cfg", {})
     bounded = _bounded_overflows(ghidra_calls)
     boundary = _boundary_writes(ghidra_calls)
 
     candidates: List[Optional[Finding]] = [
         _check_bounded_overflows(bounded),
         _check_boundary_writes(boundary),
-        _check_integer_allocations(ghidra_calls),
+        _check_integer_allocations(ghidra_calls, ghidra_cfg),
         _check_division(ghidra_calls),
-        _check_width_conversions(ghidra_calls),
+        _check_width_conversions(ghidra_calls, ghidra_cfg),
+        _check_snprintf_return_misuse(ghidra_calls, ghidra_cfg),
         _check_unbounded_writes(info, imports, parsed_imports, string_hints, ghidra_calls),
         _check_format_strings(info, imports, parsed_imports, ghidra_calls),
-        _check_file_streams(ghidra_calls),
+        _check_file_streams(ghidra_calls, ghidra_cfg),
         _check_command_sinks(parsed_imports, ghidra_calls),
         _check_syscall_filter(info),
         _check_dynamic_loading(parsed_imports),
@@ -1004,7 +1278,7 @@ def analyze(info: BinaryInfo) -> List[Finding]:
     ]
     findings: List[Finding] = [item for item in candidates if item is not None]
     findings.extend(_check_indirect_calls(ghidra_calls))
-    findings.extend(_check_heap_lifetime(ghidra_calls))
+    findings.extend(_check_heap_lifetime(ghidra_calls, ghidra_cfg))
     flag_output, flag_output_path = _flag_output_notes(ghidra_calls)
     findings.extend(_check_win_paths(info, bounded, symbols, symbol_addresses, flag_output, flag_output_path))
 
@@ -1039,7 +1313,15 @@ def analyze(info: BinaryInfo) -> List[Finding]:
             ["Map all input sources to memory writes.", "Inspect comparisons around flag and success strings."],
             "Apply bounds checks and hardening after manual review identifies the trust boundary.",
         ))
-    return sorted(findings, key=lambda finding: (SEVERITY_ORDER[finding.severity], finding.id, tuple(finding.evidence)))
+    return sorted(
+        findings,
+        key=lambda finding: (
+            SEVERITY_ORDER[finding.severity],
+            CONFIDENCE_ORDER.get(finding.confidence, 3),
+            finding.id,
+            tuple(finding.evidence),
+        ),
+    )
 
 
 def scan_bytes(data: bytes, target: str = "<memory>") -> ScanReport:
@@ -1170,6 +1452,7 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
         "language": payload.get("language"),
         "image_base": payload.get("image_base"),
         "calls": resolved_calls,
+        "cfg": payload.get("cfg") if isinstance(payload.get("cfg"), dict) else {},
     }
     metadata["parsed_imports"] = sorted(set(metadata.get("parsed_imports", [])) | clean_imports, key=str.lower)
     return BinaryInfo(

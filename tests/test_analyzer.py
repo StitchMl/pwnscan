@@ -514,12 +514,12 @@ def test_crt_indirect_calls_are_ignored_while_user_indirect_calls_remain():
         {"from": "00101208", "function": "_start", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(unique, 0x10000049, 8)"}, "arguments": []},
         {"from": "00101999", "function": "__libc_csu_init", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(unique, 0x1000008a, 8)"}, "arguments": []},
     ]}}))
-    assert not any(item.id == "PWN-CFLOW-001" for item in findings)
+    assert not any(item.id in {"PWN-CFLOW-001", "PWN-CFLOW-002", "PWN-CFLOW-003"} for item in findings)
 
     user_findings = analyze(info(metadata={"ghidra": {"calls": [
         {"from": "00101400", "function": "dispatch", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(ram, 0x104010, 8)"}, "arguments": []},
     ]}}))
-    assert any(item.id == "PWN-CFLOW-001" for item in user_findings)
+    assert any(item.id == "PWN-CFLOW-003" for item in user_findings)
 
 
 def test_fwrite_after_free_is_reported_as_uaf():
@@ -1123,3 +1123,170 @@ def test_exact_ret2win_skips_non_function_symbols():
     chain = next(item for item in findings if item.id == "PWN-FLAG-CHAIN-001")
     assert "0x401234" in chain.flag_path
     assert "0x404010" not in chain.flag_path
+
+
+def test_cfg_prevents_false_uaf_on_mutually_exclusive_branches():
+    # Block 0 branches to block 1 (free) OR block 2 (puts), neither reaches the other.
+    cfg = {"main": {"blocks": {"0": [1, 2], "1": [3], "2": [3], "3": []}}}
+    calls = [
+        {"from": "00401100", "function": "main", "block": 1, "order": 1, "to": "free", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+        {"from": "00401120", "function": "main", "block": 2, "order": 1, "to": "puts", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls, "cfg": cfg}}))
+    assert not any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_cfg_ignores_guard_string_on_unreachable_branch():
+    # Block 0 -> block 1 (free) -> block 3 (puts(ptr)); guard string is in unreachable block 2.
+    cfg = {"main": {"blocks": {"0": [1, 2], "1": [3], "2": [], "3": []}}}
+    calls = [
+        {"from": "00401100", "function": "main", "block": 1, "order": 1, "to": "free", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+        {"from": "00401110", "function": "main", "block": 2, "order": 1, "to": "puts", "arguments": [{"kind": "address_constant", "address": "00402000", "writable": False, "string": "Cannot access freed chunk"}]},
+        {"from": "00401120", "function": "main", "block": 3, "order": 1, "to": "puts", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls, "cfg": cfg}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert all("[guarded]" not in ev for ev in uaf.evidence)
+
+
+def test_cross_function_global_heap_uaf_and_double_free():
+    global_ptr = {
+        "kind": "dynamic",
+        "repr": "(unique, 0x100, 8)",
+        "expression": {
+            "op": "LOAD",
+            "size": 8,
+            "inputs": [
+                {"kind": "constant", "value": 0x1b1},
+                {"kind": "address_constant", "address": "00404080", "writable": True},
+            ],
+        },
+    }
+    calls = [
+        {"from": "00401200", "function": "delete_note", "to": "free", "arguments": [global_ptr]},
+        {"from": "00401300", "function": "edit_note", "to": "read", "arguments": [{"kind": "constant", "value": 0}, global_ptr, {"kind": "constant", "value": 32}]},
+        {"from": "00401400", "function": "purge_note", "to": "free", "arguments": [global_ptr]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    double_free = next(item for item in findings if item.id == "PWN-HEAP-001")
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any("global:00404080" in ev and "delete_note" in ev and "purge_note" in ev for ev in double_free.evidence)
+    assert any("global:00404080" in ev and "edit_note" in ev and "delete_note" in ev for ev in uaf.evidence)
+
+
+def test_cross_function_global_file_stream_close_and_reuse():
+    global_fp = {"kind": "dynamic", "repr": "(ram, 0x4040a0, 8)"}
+    calls = [
+        {"from": "00401200", "function": "close_log", "to": "fclose", "arguments": [global_fp]},
+        {"from": "00401300", "function": "write_log", "to": "fwrite", "arguments": [{"kind": "address_constant", "address": "00402010"}, {"kind": "constant", "value": 1}, {"kind": "constant", "value": 8}, global_fp]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    file_finding = next(item for item in findings if item.id == "PWN-FILE-001")
+    assert any("global:0x4040a0" in ev and "write_log" in ev and "close_log" in ev for ev in file_finding.evidence)
+
+
+def test_snprintf_return_value_misuse_detection():
+    calls = [
+        {
+            "from": "00401500",
+            "function": "format_msg",
+            "to": "snprintf",
+            "return_var": {"repr": "(register, 0x0, 4)", "size": 4, "high_name": "written"},
+            "arguments": [
+                {"kind": "stack", "stack_offset": -128, "buffer_size": 128},
+                {"kind": "constant", "value": 128},
+                {"kind": "address_constant", "address": "00402020", "writable": False, "string": "%s"},
+                {"kind": "dynamic", "high_name": "user_input"},
+            ],
+        },
+        {
+            "from": "00401530",
+            "function": "format_msg",
+            "to": "memcpy",
+            "arguments": [
+                {"kind": "stack", "stack_offset": -256, "buffer_size": 128},
+                {"kind": "stack", "stack_offset": -128, "buffer_size": 128},
+                {"kind": "dynamic", "high_name": "written"},
+            ],
+        },
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    int_finding = next(item for item in findings if item.id == "PWN-INT-003")
+    assert int_finding.severity == "medium"
+    assert int_finding.confidence == "high"
+    assert any("snprintf" in ev and "memcpy" in ev for ev in int_finding.evidence)
+
+
+def test_reassignment_by_allocator_invalidates_freed_pointer():
+    calls = [
+        {"from": "00401100", "function": "main", "to": "free", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+        {"from": "00401120", "function": "main", "to": "malloc", "return_var": {"repr": "(register, 0x0, 8)", "high_name": "ptr"}, "arguments": [{"kind": "constant", "value": 64}]},
+        {"from": "00401140", "function": "main", "to": "puts", "arguments": [{"kind": "dynamic", "high_name": "ptr"}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    assert not any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_bounds_guard_suppresses_guarded_int_and_sign_findings():
+    cfg = {
+        "main": {
+            "blocks": {"0": [1], "1": []},
+            "guards": [
+                {"block": 0, "op": "INT_LESS", "var": "high:count"},
+                {"block": 0, "op": "INT_SLESS", "var": "high:nbytes"},
+            ],
+        }
+    }
+    calls = [
+        {
+            "from": "00401200", "function": "main", "block": 1, "order": 1, "to": "malloc",
+            "arguments": [{"kind": "dynamic", "expression": {"op": "INT_MULT", "size": 8, "inputs": [{"kind": "dynamic", "high_name": "count"}, {"kind": "constant", "value": 8}]}}],
+        },
+        {
+            "from": "00401230", "function": "main", "block": 1, "order": 2, "to": "read",
+            "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "stack", "stack_offset": -64, "buffer_size": 64},
+                {"kind": "dynamic", "expression": {"op": "INT_SEXT", "size": 8, "inputs": [{"kind": "dynamic", "high_name": "nbytes"}]}},
+            ],
+        },
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls, "cfg": cfg}}))
+    assert not any(item.id in {"PWN-INT-001", "PWN-SIGN-001"} for item in findings)
+
+
+def test_unguarded_uaf_evidence_sorts_before_guarded_evidence():
+    calls = [
+        {"from": "00401100", "function": "main", "to": "free", "arguments": [{"kind": "dynamic", "high_name": "a_ptr"}]},
+        {"from": "00401110", "function": "main", "to": "puts", "arguments": [{"kind": "address_constant", "address": "00402000", "writable": False, "string": "Cannot use freed"}]},
+        {"from": "00401120", "function": "main", "to": "puts", "arguments": [{"kind": "dynamic", "high_name": "a_ptr"}]},
+        {"from": "00401200", "function": "helper", "to": "free", "arguments": [{"kind": "dynamic", "high_name": "z_ptr"}]},
+        {"from": "00401220", "function": "helper", "to": "puts", "arguments": [{"kind": "dynamic", "high_name": "z_ptr"}]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert not uaf.evidence[0].startswith("[guarded]")
+    assert any(ev.startswith("[guarded]") for ev in uaf.evidence)
+    first_guarded = next(i for i, ev in enumerate(uaf.evidence) if ev.startswith("[guarded]"))
+    assert all(not ev.startswith("[guarded]") for ev in uaf.evidence[:first_guarded])
+
+
+def test_unverified_string_hint_suppressed_when_import_or_callsite_proven():
+    findings = analyze(info(
+        imports=["strcpy"],
+        metadata={"parsed_imports": ["strcpy"], "string_import_hints": ["strcpy"]},
+    ))
+    bof = next(item for item in findings if item.id == "PWN-BOF-001")
+    assert any(ev.startswith("parsed import: strcpy") for ev in bof.evidence)
+    assert not any(ev.startswith("unverified string hint: strcpy") for ev in bof.evidence)
+
+
+def test_findings_sorted_by_severity_then_confidence():
+    # PWN-CFLOW-002 (low, medium) should appear before PWN-CFLOW-003 (low, low).
+    calls = [
+        {"from": "00401100", "function": "a", "to": None, "indirect": True, "target": {"kind": "dynamic", "repr": "(ram, 0x404010, 8)"}, "arguments": []},
+        {"from": "00401200", "function": "b", "to": None, "indirect": True, "target": {"kind": "dynamic", "expression": {"op": "LOAD", "size": 8, "inputs": [{"kind": "constant", "value": 0x1b1}, {"kind": "dynamic", "high_name": "obj"}]}}, "arguments": []},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    low_ids = [item.id for item in findings if item.severity == "low"]
+    assert low_ids.index("PWN-CFLOW-002") < low_ids.index("PWN-CFLOW-003")

@@ -204,11 +204,68 @@ def _target_name(program, operation):
     return None
 
 
+def _return_var(output):
+    if output is None:
+        return None
+    item = {"repr": str(output), "size": int(output.getSize())}
+    try:
+        if output.getHigh() is not None:
+            item["high_name"] = output.getHigh().getName()
+    except Exception:
+        pass
+    return item
+
+
+def _var_identity(node):
+    if node is None or node.isConstant():
+        return None
+    try:
+        if node.getHigh() is not None and node.getHigh().getName():
+            high_name = node.getHigh().getName()
+            if high_name not in ("UNNAMED", "null"):
+                return "high:" + high_name
+    except Exception:
+        pass
+    return "repr:" + str(node)
+
+
+def _function_cfg(high):
+    blocks = {}
+    for bb in high.getBasicBlocks():
+        succs = [int(bb.getOut(i).getIndex()) for i in range(bb.getOutSize())]
+        blocks[str(bb.getIndex())] = succs
+    guards = []
+    ops = high.getPcodeOps()
+    cmp_ops = {PcodeOp.INT_LESS, PcodeOp.INT_LESSEQUAL, PcodeOp.INT_SLESS, PcodeOp.INT_SLESSEQUAL}
+    unwrap_ops = {PcodeOp.BOOL_NEGATE, PcodeOp.COPY, PcodeOp.CAST}
+    while ops.hasNext():
+        op = ops.next()
+        if op.getOpcode() != PcodeOp.CBRANCH or op.getParent() is None or op.getNumInputs() < 2:
+            continue
+        cond = op.getInput(1)
+        for _ in range(4):
+            if cond is None or cond.getDef() is None or cond.getDef().getOpcode() not in unwrap_ops:
+                break
+            cond = cond.getDef().getInput(0)
+        cmp_def = cond.getDef() if cond is not None else None
+        if cmp_def is None or cmp_def.getNumInputs() < 2 or cmp_def.getOpcode() not in cmp_ops:
+            continue
+        for i in range(2):
+            vid = _var_identity(cmp_def.getInput(i))
+            if vid is not None:
+                guards.append({"block": int(op.getParent().getIndex()), "op": cmp_def.getMnemonic(), "var": vid})
+    cfg = {"blocks": blocks}
+    if guards:
+        cfg["guards"] = guards
+    return cfg
+
+
 def _decompiled_calls(program, monitor):
     interface = DecompInterface()
     try:
         interface.openProgram(program)
         result = []
+        cfg = {}
         iterator = program.getFunctionManager().getFunctions(True)
         while iterator.hasNext() and not monitor.isCancelled():
             function = iterator.next()
@@ -221,18 +278,26 @@ def _decompiled_calls(program, monitor):
             high = completed.getHighFunction() if completed is not None and completed.decompileCompleted() else None
             if high is None:
                 continue
+            cfg[function.getName()] = _function_cfg(high)
             operations = high.getPcodeOps()
             while operations.hasNext():
                 operation = operations.next()
                 if operation.getOpcode() not in (PcodeOp.CALL, PcodeOp.CALLIND):
                     continue
                 arguments = [_argument(program, function, operation.getInput(index)) for index in range(1, operation.getNumInputs())]
-                result.append({
+                entry = {
                     "from": str(operation.getSeqnum().getTarget()), "function": function.getName(),
+                    "order": int(operation.getSeqnum().getOrder()),
                     "to": _target_name(program, operation), "indirect": operation.getOpcode() == PcodeOp.CALLIND,
                     "target": _argument(program, function, operation.getInput(0)), "arguments": arguments,
-                })
-        return result
+                }
+                if operation.getParent() is not None:
+                    entry["block"] = int(operation.getParent().getIndex())
+                ret = _return_var(operation.getOutput())
+                if ret is not None:
+                    entry["return_var"] = ret
+                result.append(entry)
+        return result, cfg
     finally:
         interface.dispose()
 
@@ -248,7 +313,7 @@ def collect(program, monitor):
     symbols = program.getSymbolTable().getExternalSymbols()
     while symbols.hasNext():
         imports.append(symbols.next().getName(True))
-    calls = _decompiled_calls(program, monitor)
+    calls, cfg = _decompiled_calls(program, monitor)
     # Same ordering as PwnscanExport.java: raw (case-sensitive) to + function + from.
     return {
         "schema": "pwnscan-ghidra/v1", "program": program.getName(),
@@ -256,6 +321,7 @@ def collect(program, monitor):
         "functions": sorted(functions, key=lambda item: (item["name"].lower(), item["entry"])),
         "imports": sorted(set(imports), key=lambda value: (value.lower(), value)),
         "calls": sorted(calls, key=lambda item: (str(item["to"]) + "\0" + item["function"] + "\0" + item["from"])),
+        "cfg": cfg,
     }
 
 

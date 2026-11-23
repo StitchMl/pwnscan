@@ -239,7 +239,80 @@ public class PwnscanExport extends GhidraScript {
         return null;
     }
 
-    private List<Map<String, Object>> calls(Program program) {
+    private Map<String, Object> returnVar(Varnode output) {
+        if (output == null) return null;
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("repr", output.toString());
+        item.put("size", output.getSize());
+        try {
+            if (output.getHigh() != null) item.put("high_name", output.getHigh().getName());
+        } catch (RuntimeException ignored) {
+            // High variables are optional decompiler metadata.
+        }
+        return item;
+    }
+
+    private String varIdentity(Varnode node) {
+        if (node == null || node.isConstant()) return null;
+        try {
+            if (node.getHigh() != null && node.getHigh().getName() != null) {
+                String highName = node.getHigh().getName();
+                if (!highName.isEmpty() && !"UNNAMED".equals(highName) && !"null".equals(highName)) {
+                    return "high:" + highName;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Fall back to raw varnode representation.
+        }
+        return "repr:" + node.toString();
+    }
+
+    private Map<String, Object> functionCfg(HighFunction high) {
+        Map<String, Object> blocks = new LinkedHashMap<>();
+        for (ghidra.program.model.pcode.PcodeBlockBasic bb : high.getBasicBlocks()) {
+            List<Integer> succs = new ArrayList<>();
+            for (int i = 0; i < bb.getOutSize(); i++) {
+                succs.add(bb.getOut(i).getIndex());
+            }
+            blocks.put(String.valueOf(bb.getIndex()), succs);
+        }
+        List<Map<String, Object>> guards = new ArrayList<>();
+        Iterator<PcodeOpAST> ops = high.getPcodeOps();
+        while (ops.hasNext()) {
+            PcodeOpAST op = ops.next();
+            if (op.getOpcode() != PcodeOp.CBRANCH || op.getParent() == null || op.getNumInputs() < 2) continue;
+            Varnode cond = op.getInput(1);
+            for (int hop = 0; hop < 4 && cond != null && cond.getDef() != null; hop++) {
+                int cOp = cond.getDef().getOpcode();
+                if (cOp == PcodeOp.BOOL_NEGATE || cOp == PcodeOp.COPY || cOp == PcodeOp.CAST) {
+                    cond = cond.getDef().getInput(0);
+                } else {
+                    break;
+                }
+            }
+            PcodeOp cmp = cond != null ? cond.getDef() : null;
+            if (cmp == null || cmp.getNumInputs() < 2) continue;
+            int cmpOp = cmp.getOpcode();
+            if (cmpOp != PcodeOp.INT_LESS && cmpOp != PcodeOp.INT_LESSEQUAL
+                && cmpOp != PcodeOp.INT_SLESS && cmpOp != PcodeOp.INT_SLESSEQUAL) continue;
+            for (int i = 0; i < 2; i++) {
+                String vid = varIdentity(cmp.getInput(i));
+                if (vid != null) {
+                    Map<String, Object> guard = new LinkedHashMap<>();
+                    guard.put("block", op.getParent().getIndex());
+                    guard.put("op", cmp.getMnemonic());
+                    guard.put("var", vid);
+                    guards.add(guard);
+                }
+            }
+        }
+        Map<String, Object> cfg = new LinkedHashMap<>();
+        cfg.put("blocks", blocks);
+        if (!guards.isEmpty()) cfg.put("guards", guards);
+        return cfg;
+    }
+
+    private List<Map<String, Object>> calls(Program program, Map<String, Object> cfgOut) {
         List<Map<String, Object>> result = new ArrayList<>();
         DecompInterface decompiler = new DecompInterface();
         try {
@@ -253,6 +326,7 @@ public class PwnscanExport extends GhidraScript {
                 DecompileResults completed = decompiler.decompileFunction(function, 30, monitor);
                 HighFunction high = completed != null && completed.decompileCompleted() ? completed.getHighFunction() : null;
                 if (high == null) continue;
+                cfgOut.put(function.getName(), functionCfg(high));
                 Iterator<PcodeOpAST> operations = high.getPcodeOps();
                 while (operations.hasNext()) {
                     PcodeOpAST operation = operations.next();
@@ -264,9 +338,13 @@ public class PwnscanExport extends GhidraScript {
                     Map<String, Object> call = new LinkedHashMap<>();
                     call.put("from", operation.getSeqnum().getTarget().toString());
                     call.put("function", function.getName());
+                    if (operation.getParent() != null) call.put("block", operation.getParent().getIndex());
+                    call.put("order", operation.getSeqnum().getOrder());
                     call.put("to", targetName(program, operation));
                     call.put("indirect", operation.getOpcode() == PcodeOp.CALLIND);
                     call.put("target", argument(program, function, operation.getInput(0)));
+                    Map<String, Object> ret = returnVar(operation.getOutput());
+                    if (ret != null) call.put("return_var", ret);
                     call.put("arguments", arguments);
                     result.add(call);
                 }
@@ -303,6 +381,9 @@ public class PwnscanExport extends GhidraScript {
             imports.add(symbol.getName(true));
         }
 
+        Map<String, Object> cfg = new LinkedHashMap<>();
+        List<Map<String, Object>> exportedCalls = calls(currentProgram, cfg);
+
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("schema", "pwnscan-ghidra/v1");
         payload.put("program", currentProgram.getName());
@@ -310,7 +391,8 @@ public class PwnscanExport extends GhidraScript {
         payload.put("image_base", currentProgram.getImageBase().toString());
         payload.put("functions", functions);
         payload.put("imports", imports);
-        payload.put("calls", calls(currentProgram));
+        payload.put("calls", exportedCalls);
+        payload.put("cfg", cfg);
 
         String[] arguments = getScriptArgs();
         File output = arguments.length > 0 ? new File(arguments[0]) : askFile("Save pwnscan Ghidra export", "Save");
