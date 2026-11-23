@@ -1017,3 +1017,109 @@ def test_guarded_use_after_free_is_marked():
     uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
     assert any(evidence.startswith("[guarded]") for evidence in uaf.evidence)
     assert any(not evidence.startswith("[guarded]") for evidence in uaf.evidence)
+
+
+def test_createprocess_and_execl_detect_dynamic_command_arguments():
+    calls = [
+        {
+            "from": "00401100",
+            "function": "main",
+            "to": "CreateProcessA",
+            "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "dynamic", "repr": "(unique, 0x100, 8)"},
+            ],
+        },
+        {
+            "from": "00401140",
+            "function": "run_shell",
+            "to": "execl",
+            "arguments": [
+                {"kind": "address_constant", "address": "00402000", "string": "/bin/sh"},
+                {"kind": "address_constant", "address": "00402008", "string": "sh"},
+                {"kind": "address_constant", "address": "0040200b", "string": "-c"},
+                {"kind": "dynamic", "repr": "(unique, 0x200, 8)"},
+            ],
+        },
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    cmd = next(item for item in findings if item.id == "PWN-CMD-001")
+    assert cmd.severity == "high"
+    assert any("CreateProcessA" in evidence for evidence in cmd.evidence)
+    assert any("execl" in evidence for evidence in cmd.evidence)
+
+
+def test_asprintf_dynamic_format_is_high_finding():
+    calls = [
+        {
+            "from": "00401200",
+            "function": "greet",
+            "to": "asprintf",
+            "arguments": [
+                {"kind": "stack", "stack_offset": -16},
+                {"kind": "dynamic", "repr": "(unique, 0x300, 8)"},
+            ],
+        },
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    fmt = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert fmt.severity == "high"
+    assert any("asprintf" in evidence for evidence in fmt.evidence)
+
+
+def test_fread_width_conversion_triggers_sign_finding():
+    calls = [
+        {
+            "from": "00401300",
+            "function": "load",
+            "to": "fread",
+            "arguments": [
+                {"kind": "stack", "stack_offset": -64},
+                {"kind": "constant", "value": 1},
+                _dyn_expr("INT_SEXT"),
+                {"kind": "dynamic", "repr": "(register, 0x0, 8)"},
+            ],
+        },
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    sign = next(item for item in findings if item.id == "PWN-SIGN-001")
+    assert sign.severity == "high"
+    assert any("fread" in evidence for evidence in sign.evidence)
+
+
+def test_aligned_alloc_and_new_array_wrap_arithmetic():
+    calls = [
+        {"from": "00401400", "function": "main", "to": "aligned_alloc", "arguments": [{"kind": "constant", "value": 16}, _dyn_expr("INT_MULT")]},
+        {"from": "00401440", "function": "main", "to": "operator new[]", "arguments": [_dyn_expr("INT_ADD")]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    int_finding = next(item for item in findings if item.id == "PWN-INT-001")
+    assert any("aligned_alloc" in evidence for evidence in int_finding.evidence)
+    assert any("operator new[]" in evidence for evidence in int_finding.evidence)
+
+
+def test_exact_ret2win_skips_non_function_symbols():
+    calls = [
+        {
+            "from": "00401100",
+            "function": "vuln",
+            "to": "read",
+            "arguments": [
+                {"kind": "constant", "value": 0},
+                {"kind": "stack", "stack_offset": -32, "buffer_size": 32, "return_address_offset": 40},
+                {"kind": "constant", "value": 64},
+            ],
+        },
+    ]
+    findings = analyze(info(
+        symbols=["secret", "win"],
+        mitigations={"nx": True, "pie": False, "stack_canary": False},
+        metadata={
+            "symbol_addresses": {"secret": 0x404010, "win": 0x401234},
+            "function_symbols": ["win"],
+            "ghidra": {"calls": calls},
+        },
+    ))
+    chain = next(item for item in findings if item.id == "PWN-FLAG-CHAIN-001")
+    assert "0x401234" in chain.flag_path
+    assert "0x404010" not in chain.flag_path

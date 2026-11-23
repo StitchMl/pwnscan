@@ -27,12 +27,13 @@ class _ElfSection:
 BIN_SH = "/bin/sh"
 ASCII_RE = re.compile(rb"[\x20-\x7e]{4,}")
 INTERESTING_APIS = (
-    "gets", "strcpy", "strcat", "sprintf", "vsprintf", "scanf", "sscanf",
-    "fscanf", "read", "recv", "memcpy", "printf", "fprintf", "syslog",
-    "system", "popen", "execve", "execv", "execvp", "execvpe", "execl",
-    "execlp", "execle", "posix_spawn", "posix_spawnp", "wordexp",
+    "gets", "strcpy", "stpcpy", "strcat", "sprintf", "vsprintf", "asprintf", "vasprintf",
+    "scanf", "sscanf", "fscanf", "read", "recv", "memcpy", "printf", "fprintf", "syslog",
+    "system", "popen", "execve", "execv", "execvp", "execvpe", "execl", "execlp", "execle",
+    "posix_spawn", "posix_spawnp", "wordexp",
     "mprotect", "VirtualProtect", "WinExec",
-    "CreateProcess", "LoadLibrary", "LoadLibraryA", "LoadLibraryW", "GetProcAddress", "dlopen", "dlsym",
+    "CreateProcess", "CreateProcessA", "CreateProcessW",
+    "LoadLibrary", "LoadLibraryA", "LoadLibraryW", "GetProcAddress", "dlopen", "dlsym",
     "prctl", "seccomp", "seccomp_init", "seccomp_rule_add",
     "malloc", "calloc", "realloc", "free", "operator new", "operator delete",
 )
@@ -236,7 +237,7 @@ def parse_elf(data: bytes) -> BinaryInfo:
 
     nx, relro, bind_now, dynamic, has_interp, is_pie_flag = _elf_program_headers(data, bits, endian_char, phoff, phentsize, phnum)
     sections = _elf_sections(data, bits, endian_char, shoff, shentsize, shnum, shstrndx)
-    symbols, symbol_addresses, undefined_symbols, has_symtab = _elf_symbols(data, bits, endian_char, sections)
+    symbols, symbol_addresses, undefined_symbols, has_symtab, function_symbols = _elf_symbols(data, bits, endian_char, sections)
     values = extract_strings(data)
     parsed_imports, string_hints, imports = _split_imports(undefined_symbols, values)
     fortified_imports = sorted({name for name in undefined_symbols if name in FORTIFY_APIS}, key=str.lower)
@@ -256,6 +257,7 @@ def parse_elf(data: bytes) -> BinaryInfo:
             "dynamic": dynamic, "relro": relro_state, "sections": sorted({section.name for section in sections}),
             "parsed_imports": parsed_imports, "fortified_imports": fortified_imports, "string_import_hints": string_hints,
             "symbol_addresses": symbol_addresses,
+            "function_symbols": function_symbols,
             "plt_addresses": plt_addresses,
             "string_addresses": _elf_string_addresses(data, sections),
             **_elf_exploit_metadata(data, bits, sections, architecture),
@@ -304,38 +306,43 @@ def _elf_sections(data: bytes, bits: int, endian: str, shoff: int, entsize: int,
     return result
 
 
-def _elf_symbol_table(data: bytes, bits: int, endian: str, section: _ElfSection, strings: bytes) -> List[Tuple[str, int, int]]:
+def _elf_symbol_table(data: bytes, bits: int, endian: str, section: _ElfSection, strings: bytes) -> List[Tuple[str, int, int, int]]:
     wide = bits == 64
     default_size = 24 if wide else 16
     stride = section.item_size or default_size
     if stride < default_size:
         return []
     value_at = 8 if wide else 4
+    info_at = 4 if wide else 12
     index_at = 6 if wide else 14
     value_fmt = "Q" if wide else "I"
-    entries: List[Tuple[str, int, int]] = []
+    entries: List[Tuple[str, int, int, int]] = []
     for at in range(section.offset, min(len(data), section.offset + section.size), stride):
         if at + default_size > len(data):
             break
         name = _c_string(strings, _u(data, at, "I", endian))
         if name:
-            entries.append((name, _u(data, at + value_at, value_fmt, endian), _u(data, at + index_at, "H", endian)))
+            sym_type = data[at + info_at] & 0xF
+            entries.append((name, _u(data, at + value_at, value_fmt, endian), _u(data, at + index_at, "H", endian), sym_type))
     return entries
 
 
-def _merge_symbol_entries(entries: Sequence[Tuple[str, int, int]], result: Set[str], addresses: Dict[str, int], undefined: Set[str]) -> None:
-    for name, value, section_index in entries:
+def _merge_symbol_entries(entries: Sequence[Tuple[str, int, int, int]], result: Set[str], addresses: Dict[str, int], undefined: Set[str], function_symbols: Set[str]) -> None:
+    for name, value, section_index, sym_type in entries:
         result.add(name)
         if value and section_index != 0 and (name not in addresses or value < addresses[name]):
             addresses[name] = value
+        if sym_type == 2 and section_index != 0 and value:
+            function_symbols.add(name)
         if section_index == 0:
             undefined.add(name)
 
 
-def _elf_symbols(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSection]) -> Tuple[List[str], Dict[str, int], List[str], bool]:
+def _elf_symbols(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSection]) -> Tuple[List[str], Dict[str, int], List[str], bool, List[str]]:
     result: Set[str] = set()
     addresses: Dict[str, int] = {}
     undefined: Set[str] = set()
+    function_symbols: Set[str] = set()
     has_symtab = False
     for section in sections:
         if section.kind not in {2, 11}:
@@ -345,12 +352,13 @@ def _elf_symbols(data: bytes, bits: int, endian: str, sections: Sequence[_ElfSec
         if strtab is None or strtab.kind == 8:
             continue
         strings = data[strtab.offset:min(len(data), strtab.offset + strtab.size)]
-        _merge_symbol_entries(_elf_symbol_table(data, bits, endian, section, strings), result, addresses, undefined)
+        _merge_symbol_entries(_elf_symbol_table(data, bits, endian, section, strings), result, addresses, undefined, function_symbols)
     return (
         sorted(result, key=lambda value: (value.lower(), value)),
         {name: addresses[name] for name in sorted(addresses, key=str.lower)},
         sorted(undefined, key=str.lower),
         has_symtab,
+        sorted(function_symbols, key=lambda value: (value.lower(), value)),
     )
 
 
@@ -632,6 +640,69 @@ def _pe_flag(dll_chars: Optional[int], mask: int) -> Optional[bool]:
     return None if dll_chars is None else bool(dll_chars & mask)
 
 
+def _pe_stack_canary(
+    data: bytes, bits: int, opt: int, optional_size: int, data_dir_off: int,
+    sections: Sequence[Tuple[str, int, int, int, int, int]], first_section_va: int,
+    strings: Sequence[str], parsed_imports: Sequence[str],
+) -> Optional[bool]:
+    if data_dir_off + 88 <= optional_size:
+        load_cfg_rva = _u(data, opt + data_dir_off + 80, "I")
+        load_cfg_size = _u(data, opt + data_dir_off + 84, "I")
+        min_cfg_size = 64 if bits == 32 else 96
+        if load_cfg_rva and load_cfg_size >= min_cfg_size:
+            off = _pe_rva_to_offset(data, sections, first_section_va, load_cfg_rva)
+            if off is not None and off + min_cfg_size <= len(data):
+                cookie_at = off + (60 if bits == 32 else 88)
+                cookie = _u(data, cookie_at, "I" if bits == 32 else "Q")
+                return cookie != 0
+    if any(name in {"__security_cookie", "__report_gsfailure"} for name in parsed_imports) or any(
+        "__security_cookie" in value or "__report_gsfailure" in value for value in strings
+    ):
+        return True
+    return None
+
+
+def _pe_string_addresses(
+    data: bytes, image_base: int, sections: Sequence[Tuple[str, int, int, int, int, int]], limit: int = 200000,
+) -> Dict[str, List[int]]:
+    pattern = re.compile(rb"[\x20-\x7e]{2,}")
+    result: Dict[str, List[int]] = {}
+    total = 0
+    ordered = sorted(sections, key=lambda section: 1 if section[5] & 0x20000000 else 0)
+    for _, va, _, raw, rs, _ in ordered:
+        if not va or not rs:
+            continue
+        blob = data[raw:min(len(data), raw + rs)]
+        for match in pattern.finditer(blob):
+            if total >= limit:
+                break
+            result.setdefault(match.group().decode("ascii", "replace"), []).append(image_base + va + match.start())
+            total += 1
+        if total >= limit:
+            break
+    return {key: sorted(set(values)) for key, values in sorted(result.items())}
+
+
+def _pe_exploit_metadata(
+    data: bytes, bits: int, image_base: int, sections: Sequence[Tuple[str, int, int, int, int, int]], architecture: str,
+) -> Dict[str, object]:
+    patterns = _gadget_patterns(bits, architecture)
+    gadgets: Dict[str, List[int]] = {name: [] for name in patterns}
+    useful: Dict[str, List[int]] = {BIN_SH: []}
+    for _, va, _, raw, rs, flags in sections:
+        if not rs or not va:
+            continue
+        blob = data[raw:min(len(data), raw + rs)]
+        if flags & 0x20000000:
+            for label, needle in patterns.items():
+                _collect_matches(blob, needle, image_base + va, gadgets[label], 8)
+        _collect_matches(blob, BIN_SH.encode("ascii") + b"\0", image_base + va, useful[BIN_SH], 4)
+    return {
+        "gadgets": {name: values for name, values in sorted(gadgets.items()) if values},
+        "useful_strings": {name: values for name, values in sorted(useful.items()) if values},
+    }
+
+
 def parse_pe(data: bytes) -> BinaryInfo:
     if len(data) < 0x40:
         raise ParseError("truncated DOS header")
@@ -662,19 +733,23 @@ def parse_pe(data: bytes) -> BinaryInfo:
     values = extract_strings(data)
     string_hints = sorted(set(_interesting_names(values)) - set(parsed_imports), key=str.lower)
     imports.update(string_hints)
+    architecture = PE_MACHINES.get(machine, "machine-%d" % machine)
+    stack_canary = _pe_stack_canary(data, bits, opt, optional_size, data_dir_off, sections, first_section_va, values, parsed_imports)
     writable_executable = any((flags & 0x80000000) and (flags & 0x20000000) for *_, flags in sections)
     return BinaryInfo(
-        format="PE", bits=bits, endian="little", architecture=PE_MACHINES.get(machine, "machine-%d" % machine),
+        format="PE", bits=bits, endian="little", architecture=architecture,
         entrypoint=image_base + entry_rva if entry_rva else None, image_base=image_base,
         imports=sorted(imports, key=str.lower),
         symbols=sorted(exported_symbols, key=lambda value: (value.lower(), value)),
         strings=values,
-        mitigations={"nx": _pe_flag(dll_chars, 0x0100), "aslr": _pe_flag(dll_chars, 0x0040), "cfg": _pe_flag(dll_chars, 0x4000), "stack_canary": None, "writable_executable": writable_executable},
+        mitigations={"nx": _pe_flag(dll_chars, 0x0100), "aslr": _pe_flag(dll_chars, 0x0040), "cfg": _pe_flag(dll_chars, 0x4000), "stack_canary": stack_canary, "writable_executable": writable_executable},
         metadata={
             "dll": bool(characteristics & 0x2000), "sections": sorted(section[0] for section in sections),
             "parsed_imports": parsed_imports, "string_import_hints": string_hints,
             "symbol_addresses": {name: symbol_addresses[name] for name in sorted(symbol_addresses, key=str.lower)},
             "rwx_sections": sorted(section[0] for section in sections if (section[5] & 0x80000000) and (section[5] & 0x20000000)),
+            "string_addresses": _pe_string_addresses(data, image_base, sections),
+            **_pe_exploit_metadata(data, bits, image_base, sections, architecture),
         },
     )
 

@@ -489,3 +489,56 @@ def test_macho_stub_sections_map_to_undefined_symbols():
     struct.pack_into("<IBBHQ", data, 0x180, 1, 0x01, 0, 0, 0)  # undefined external _gets
     info = parse_binary(bytes(data))
     assert info.metadata["plt_addresses"] == {"0x100001000": "gets"}
+
+
+def test_pe_load_config_canary_string_addresses_and_gadgets():
+    # Minimal PE64 with .text (executable, pop rdi; ret + /bin/sh) and .rdata (LoadConfig + "%127s")
+    data = bytearray(0x600)
+    struct.pack_into("<H", data, 0, 0x5A4D)
+    pe_at = 0x80
+    struct.pack_into("<I", data, 0x3C, pe_at)
+    data[pe_at:pe_at + 4] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", data, pe_at + 4, 0x8664, 2, 0, 0, 0, 240, 0x22)
+    opt = pe_at + 24
+    struct.pack_into("<H", data, opt, 0x20B)
+    struct.pack_into("<I", data, opt + 16, 0x1000)
+    struct.pack_into("<Q", data, opt + 24, 0x140000000)
+    struct.pack_into("<H", data, opt + 70, 0x0140)  # NX + ASLR
+    # DataDirectory[10] (LoadConfig) at opt + 112 + 80
+    struct.pack_into("<II", data, opt + 112 + 80, 0x2000, 0x70)
+    sec_at = opt + 240
+    # .text at RVA 0x1000, raw 0x200, size 0x100, executable
+    struct.pack_into("<8sIIIIIIHHI", data, sec_at, b".text", 0x100, 0x1000, 0x100, 0x200, 0, 0, 0, 0, 0x60000020)
+    # .rdata at RVA 0x2000, raw 0x300, size 0x100, read-only
+    struct.pack_into("<8sIIIIIIHHI", data, sec_at + 40, b".rdata", 0x100, 0x2000, 0x100, 0x300, 0, 0, 0, 0, 0x40000040)
+    data[0x200:0x202] = b"\x5f\xc3"  # pop rdi; ret
+    data[0x300:0x304] = struct.pack("<I", 0x70)  # LoadConfig.Size
+    struct.pack_into("<Q", data, 0x300 + 88, 0x140003000)  # non-zero SecurityCookie
+    data[0x380:0x386] = b"%127s\0"
+
+    info_on = parse_binary(bytes(data))
+    assert info_on.mitigations["stack_canary"] is True
+    assert info_on.metadata["gadgets"]["pop_rdi_ret"] == [0x140001000]
+    assert info_on.metadata["string_addresses"]["%127s"] == [0x140002080]
+
+    struct.pack_into("<Q", data, 0x300 + 88, 0)  # zero SecurityCookie
+    info_off = parse_binary(bytes(data))
+    assert info_off.mitigations["stack_canary"] is False
+
+
+def test_elf_function_symbols_excludes_data_objects():
+    from pwnscan.parsers import _elf_symbols, _ElfSection
+
+    strtab_data = b"\0secret\0win\0"
+    symtab_data = bytearray(3 * 24)
+    # Entry 1: secret (STT_OBJECT=1, shndx=2, value=0x404010)
+    struct.pack_into("<IBBHQQ", symtab_data, 24, 1, 0x11, 0, 2, 0x404010, 8)
+    # Entry 2: win (STT_FUNC=2, shndx=1, value=0x401200)
+    struct.pack_into("<IBBHQQ", symtab_data, 48, 8, 0x12, 0, 1, 0x401200, 32)
+    blob = bytes(symtab_data) + strtab_data
+    symtab = _ElfSection(".symtab", 2, 0, 0, 0, len(symtab_data), 1, 24)
+    strtab = _ElfSection(".strtab", 3, 0, 0, len(symtab_data), len(strtab_data), 0, 0)
+    symbols, addresses, _, _, func_syms = _elf_symbols(blob, 64, "<", [symtab, strtab])
+    assert "secret" in symbols and "win" in symbols
+    assert addresses["secret"] == 0x404010
+    assert func_syms == ["win"]

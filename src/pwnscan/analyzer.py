@@ -13,20 +13,30 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 UNBOUNDED_FORMAT = "may use an unbounded %s"
 UNKNOWN = "<unknown>"
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": UNBOUNDED_FORMAT, "sscanf": UNBOUNDED_FORMAT, "fscanf": UNBOUNDED_FORMAT, "__isoc99_scanf": UNBOUNDED_FORMAT, "__isoc99_sscanf": UNBOUNDED_FORMAT, "__isoc99_fscanf": UNBOUNDED_FORMAT}
-FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "syslog"}
+FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "asprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "vasprintf", "syslog"}
 FORMAT_INDEXES = {
     "printf": 0, "vprintf": 0,
-    "fprintf": 1, "dprintf": 1, "sprintf": 1, "vfprintf": 1, "vsprintf": 1, "syslog": 1,
+    "fprintf": 1, "dprintf": 1, "sprintf": 1, "asprintf": 1, "vfprintf": 1, "vsprintf": 1, "vasprintf": 1, "syslog": 1,
     "snprintf": 2, "vsnprintf": 2,
     "printf_chk": 1, "vprintf_chk": 1,
-    "fprintf_chk": 2, "dprintf_chk": 2, "vfprintf_chk": 2,
+    "fprintf_chk": 2, "dprintf_chk": 2, "vfprintf_chk": 2, "asprintf_chk": 2, "vasprintf_chk": 2,
     "sprintf_chk": 3, "vsprintf_chk": 3,
     "snprintf_chk": 4, "vsnprintf_chk": 4,
 }
 COMMAND_SINKS = {
     "system", "popen", "execve", "execv", "execvp", "execvpe", "execl", "execlp", "execle",
-    "posix_spawn", "posix_spawnp", "wordexp", "WinExec", "CreateProcess",
+    "posix_spawn", "posix_spawnp", "wordexp", "WinExec", "CreateProcess", "CreateProcessA", "CreateProcessW",
 }
+COMMAND_ARG_INDEXES = {
+    "CreateProcess": (0, 1),
+    "CreateProcessA": (0, 1),
+    "CreateProcessW": (0, 1),
+    "execv": (0, 1),
+    "execvp": (0, 1),
+    "execvpe": (0, 1),
+    "execve": (0, 1),
+}
+VARARG_COMMAND_SINKS = {"execl", "execlp", "execle"}
 BOUNDED_WRITES = {
     "read": (1, 2), "recv": (1, 2), "recvfrom": (1, 2), "pread": (1, 2), "pread64": (1, 2),
     "memcpy": (0, 2), "memmove": (0, 2), "strncpy": (0, 2), "strncat": (0, 2),
@@ -108,9 +118,9 @@ def _expand_name_set(names: set) -> None:
         names.add(_strip_underscores(name))
 
 
-for _table in (UNBOUNDED, FORMAT_INDEXES, BOUNDED_WRITES, HEAP_DEREFERENCE_ARGUMENTS, INPUT_FILLERS, SCANF_FORMAT_INDEX, FILE_STREAM_ARGS, FILE_WRITE_DESTS, FLAG_FD_SINKS):
+for _table in (UNBOUNDED, FORMAT_INDEXES, BOUNDED_WRITES, HEAP_DEREFERENCE_ARGUMENTS, INPUT_FILLERS, SCANF_FORMAT_INDEX, FILE_STREAM_ARGS, FILE_WRITE_DESTS, FLAG_FD_SINKS, COMMAND_ARG_INDEXES):
     _expand_name_table(_table)
-for _names in (FORMAT_SINKS, COMMAND_SINKS, DEALLOCATORS, FLAG_OPEN_NAMES, OUTPUT_STRING_NAMES):
+for _names in (FORMAT_SINKS, COMMAND_SINKS, VARARG_COMMAND_SINKS, DEALLOCATORS, FLAG_OPEN_NAMES, OUTPUT_STRING_NAMES):
     _expand_name_set(_names)
 
 
@@ -363,7 +373,9 @@ def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Seque
         return None
     if info.bits not in {32, 64} or info.endian not in {"little", "big"}:
         return None
-    addressed = [(name, symbol_addresses.get(name)) for name in win_symbols]
+    function_symbols = set(info.metadata.get("function_symbols") or ())
+    candidate_names = [name for name in win_symbols if name in function_symbols] if function_symbols else list(win_symbols)
+    addressed = [(name, symbol_addresses.get(name)) for name in candidate_names]
     addressed = [(name, address) for name, address in addressed if isinstance(address, int) and address > 0]
     if not addressed:
         return None
@@ -443,7 +455,11 @@ def _check_boundary_writes(boundary: Sequence[dict]) -> Optional[Finding]:
 
 def _check_integer_allocations(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     # calloc is excluded: the allocator checks the count*size product internally.
-    allocation_indexes = {"malloc": {0}, "realloc": {1}, "operator new": {0}, "new": {0}}
+    allocation_indexes = {
+        "malloc": {0}, "realloc": {1}, "aligned_alloc": {1},
+        "memalign": {1}, "posix_memalign": {2},
+        "operator new": {0}, "operator new[]": {0}, "new": {0},
+    }
     arithmetic_allocations = []
     for call in ghidra_calls:
         name = _call_name(call)
@@ -501,13 +517,17 @@ def _check_width_conversions(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     width_changed_lengths = []
     for call in ghidra_calls:
         name = _call_name(call)
-        if name not in BOUNDED_WRITES:
+        if name == "fread":
+            length_indexes: tuple[int, ...] = (1, 2)
+        elif name in BOUNDED_WRITES:
+            length_indexes = (BOUNDED_WRITES[name][1],)
+        else:
             continue
-        _, length_index = BOUNDED_WRITES[name]
-        argument = _call_argument(call, length_index)
-        operations = _expression_ops(argument)
-        if (operations & WIDTH_CHANGE_OPS) and _expression_has_dynamic_input(argument):
-            width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
+        for length_index in length_indexes:
+            argument = _call_argument(call, length_index)
+            operations = _expression_ops(argument)
+            if (operations & WIDTH_CHANGE_OPS) and _expression_has_dynamic_input(argument):
+                width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
     if not width_changed_lengths:
         return None
     return _finding(
@@ -774,11 +794,18 @@ def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: s
     return None
 
 
+def _has_dynamic_command_argument(call: dict) -> bool:
+    name = _call_name(call)
+    if name not in COMMAND_SINKS:
+        return False
+    if name in VARARG_COMMAND_SINKS:
+        arguments = call.get("arguments")
+        return isinstance(arguments, list) and any(isinstance(arg, dict) and _dynamic_argument(arg) for arg in arguments)
+    return any(_dynamic_argument(_call_argument(call, index)) for index in COMMAND_ARG_INDEXES.get(name, (0,)))
+
+
 def _check_command_sinks(parsed_imports: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
-    dynamic_command_calls = [
-        item for item in ghidra_calls
-        if _call_name(item) in COMMAND_SINKS and _dynamic_argument(_call_argument(item, 0))
-    ]
+    dynamic_command_calls = [item for item in ghidra_calls if _has_dynamic_command_argument(item)]
     if dynamic_command_calls:
         return _finding(
             "PWN-CMD-001", "Dynamic command execution candidate", "high", "high",
@@ -1067,6 +1094,42 @@ def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict, ghidra_b
     return sorted(resolved, key=lambda item: (str(item.get("to", "")), str(item.get("from", ""))))
 
 
+def _fill_missing_strings(resolved_calls: Sequence[dict], string_addresses: object, ghidra_base: int) -> None:
+    if not isinstance(string_addresses, dict) or not string_addresses:
+        return
+    address_to_string: dict[int, str] = {}
+    for text, addresses in string_addresses.items():
+        if isinstance(text, str) and isinstance(addresses, list):
+            for address in addresses:
+                if isinstance(address, int):
+                    address_to_string[address] = text
+    if not address_to_string:
+        return
+    for call in resolved_calls:
+        arguments = call.get("arguments")
+        if not isinstance(arguments, list):
+            continue
+        updated_args = None
+        for index, argument in enumerate(arguments):
+            if not isinstance(argument, dict) or argument.get("kind") != "address_constant" or argument.get("string"):
+                continue
+            try:
+                address = int(str(argument.get("address")), 16)
+            except (TypeError, ValueError):
+                continue
+            candidates = [address]
+            if ghidra_base and address >= ghidra_base:
+                candidates.append(address - ghidra_base)
+            for candidate in candidates:
+                if candidate in address_to_string:
+                    if updated_args is None:
+                        updated_args = list(arguments)
+                    updated_args[index] = {**argument, "string": address_to_string[candidate]}
+                    break
+        if updated_args is not None:
+            call["arguments"] = updated_args
+
+
 def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
     try:
         payload = json.loads(export_path.read_text(encoding="utf-8"))
@@ -1091,6 +1154,9 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
         except ValueError:
             continue
     metadata["symbol_addresses"] = {name: addresses[name] for name in sorted(addresses, key=str.lower)}
+    if "function_symbols" in metadata or function_names:
+        merged_funcs = set(metadata.get("function_symbols", [])) | function_names
+        metadata["function_symbols"] = sorted(merged_funcs, key=lambda value: (value.lower(), value))
     plt_addresses = metadata.get("plt_addresses", {})
     ghidra_base = 0
     if isinstance(payload.get("image_base"), str):
@@ -1099,33 +1165,7 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
         except ValueError:
             ghidra_base = 0
     resolved_calls = _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base)
-    string_addresses = metadata.get("string_addresses")
-    if isinstance(string_addresses, dict) and string_addresses:
-        address_to_string: dict[int, str] = {}
-        for text, addresses in string_addresses.items():
-            if isinstance(text, str) and isinstance(addresses, list):
-                for address in addresses:
-                    if isinstance(address, int):
-                        address_to_string[address] = text
-        for call in resolved_calls:
-            arguments = call.get("arguments")
-            if not isinstance(arguments, list):
-                continue
-            for argument in arguments:
-                if not isinstance(argument, dict) or argument.get("kind") != "address_constant" or argument.get("string"):
-                    continue
-                raw_address = argument.get("address")
-                try:
-                    address = int(str(raw_address), 16)
-                except (TypeError, ValueError):
-                    continue
-                candidates = [address]
-                if ghidra_base and address >= ghidra_base:
-                    candidates.append(address - ghidra_base)
-                for candidate in candidates:
-                    if candidate in address_to_string:
-                        argument["string"] = address_to_string[candidate]
-                        break
+    _fill_missing_strings(resolved_calls, metadata.get("string_addresses"), ghidra_base)
     metadata["ghidra"] = {
         "language": payload.get("language"),
         "image_base": payload.get("image_base"),
