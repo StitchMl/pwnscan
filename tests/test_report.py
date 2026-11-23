@@ -87,3 +87,40 @@ def test_use_color_modes_and_no_color_env(monkeypatch):
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("pwnscan.report.sys.stdout", SimpleNamespace(isatty=lambda: False))
     assert use_color("auto") is False
+
+
+def test_render_text_color_hierarchy_mitigations_and_status():
+    binary = BinaryInfo(
+        format="ELF", bits=64, endian="little", architecture="x86_64", entrypoint=0x401000,
+        imports=["gets"], mitigations={"nx": True, "pie": False, "stack_canary": None},
+    )
+    finding = Finding(
+        id="PWN-FLAG-CHAIN-001", title="Exact ret2win chain", severity="critical", confidence="high",
+        evidence=["[guarded] blocked path", "direct path"], attack_vector="Vector", validation=["Step 1"],
+        patch="Fix", exploit_status="payload-ready",
+    )
+    colored = render_text(ScanReport("pwnscan/v1", "a.out", "0" * 64, 100, binary, [finding]), color=True)
+    assert "nx=\033[32mon\033[0m" in colored
+    assert "pie=\033[31moff\033[0m" in colored
+    assert "stack_canary=\033[2munknown\033[0m" in colored
+    assert "\033[1;36mhigh\033[0m" in colored
+    assert "\033[1;32mpayload-ready\033[0m" in colored
+    assert "\033[2m[guarded] blocked path\033[0m" in colored
+
+
+def test_render_text_wraps_long_fields_and_imports_aligned():
+    binary = BinaryInfo(
+        format="ELF", bits=64, endian="little", architecture="x86_64", entrypoint=0x401000,
+        imports=["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india"],
+        mitigations={"nx": True},
+    )
+    finding = Finding(
+        id="PWN-BOF-001", title="Overflow", severity="high", confidence="high",
+        evidence=["ev"], attack_vector="word " * 20, validation=["v"], patch="p",
+    )
+    rendered = render_text(ScanReport("pwnscan/v1", "a.out", "0" * 64, 100, binary, [finding]), color=False, width=60)
+    lines = rendered.splitlines()
+    imports_idx = next(i for i, line in enumerate(lines) if line.startswith("imports: "))
+    assert lines[imports_idx + 1].startswith(" " * len("imports: "))
+    vector_idx = next(i for i, line in enumerate(lines) if line.startswith("  vector:"))
+    assert lines[vector_idx + 1].startswith(" " * 14)
