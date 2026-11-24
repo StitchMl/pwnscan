@@ -718,12 +718,12 @@ def _check_division(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     )
 
 
-def _length_indexes(name: str) -> tuple[int, ...]:
+def _length_indexes(name: str) -> list[int]:
     if name == "fread":
-        return (1, 2)
+        return [1, 2]
     if name in BOUNDED_WRITES:
-        return (BOUNDED_WRITES[name][1],)
-    return ()
+        return [BOUNDED_WRITES[name][1]]
+    return []
 
 
 def _unguarded_width_ops(call: dict, length_index: int, cfg: dict | None) -> Optional[list[str]]:
