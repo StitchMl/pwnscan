@@ -539,6 +539,7 @@ def test_elf_function_symbols_excludes_data_objects():
     symtab = _ElfSection(".symtab", 2, 0, 0, 0, len(symtab_data), 1, 24)
     strtab = _ElfSection(".strtab", 3, 0, 0, len(symtab_data), len(strtab_data), 0, 0)
     symbols, addresses, _, _, func_syms = _elf_symbols(blob, 64, "<", [symtab, strtab])
-    assert "secret" in symbols and "win" in symbols
+    assert "secret" in symbols
+    assert "win" in symbols
     assert addresses["secret"] == 0x404010
     assert func_syms == ["win"]

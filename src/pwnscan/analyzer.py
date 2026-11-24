@@ -3,16 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from .model import BinaryInfo, Finding, ScanReport
+from .model import GUARDED_PREFIX, NO_FLAG_PATH, BinaryInfo, Finding, ScanReport
 from .parsers import parse_binary
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 UNBOUNDED_FORMAT = "may use an unbounded %s"
 UNKNOWN = "<unknown>"
+REPR_ID = "repr:%s"
+GLOBAL_ID = "global:%s"
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": UNBOUNDED_FORMAT, "sscanf": UNBOUNDED_FORMAT, "fscanf": UNBOUNDED_FORMAT, "__isoc99_scanf": UNBOUNDED_FORMAT, "__isoc99_sscanf": UNBOUNDED_FORMAT, "__isoc99_fscanf": UNBOUNDED_FORMAT}
 FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "asprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "vasprintf", "syslog"}
 FORMAT_INDEXES = {
@@ -110,13 +113,15 @@ def _expand_name_table(table: dict) -> None:
     ``_call_name`` (stripped), so the tables must contain the stripped keys.
     """
 
-    for key in list(table):
-        table.setdefault(_strip_underscores(key), table[key])
+    stripped: dict = {}
+    for key, value in table.items():
+        stripped.setdefault(_strip_underscores(key), value)
+    for key, value in stripped.items():
+        table.setdefault(key, value)
 
 
 def _expand_name_set(names: set) -> None:
-    for name in list(names):
-        names.add(_strip_underscores(name))
+    names.update({_strip_underscores(name) for name in names})
 
 
 for _table in (UNBOUNDED, FORMAT_INDEXES, BOUNDED_WRITES, HEAP_DEREFERENCE_ARGUMENTS, INPUT_FILLERS, SCANF_FORMAT_INDEX, FILE_STREAM_ARGS, FILE_WRITE_DESTS, FLAG_FD_SINKS, COMMAND_ARG_INDEXES):
@@ -125,13 +130,13 @@ for _names in (FORMAT_SINKS, COMMAND_SINKS, VARARG_COMMAND_SINKS, DEALLOCATORS, 
     _expand_name_set(_names)
 
 
-def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = "Manual confirmation required before a flag-recovery payload exists.") -> Finding:
+def _finding(identity: str, title: str, severity: str, confidence: str, evidence: Sequence[str], vector: str, validation: Sequence[str], patch: str, exploit_status: str = "validation-only", flag_path: str = NO_FLAG_PATH) -> Finding:
     return Finding(
         identity,
         title,
         severity,
         confidence,
-        sorted(set(evidence), key=lambda item: (item.startswith("[guarded] "), item.lower())),
+        sorted(set(evidence), key=lambda item: (item.startswith(GUARDED_PREFIX), item.lower())),
         vector,
         list(validation),
         patch,
@@ -216,7 +221,50 @@ def _argument_identity(argument: dict) -> str | None:
         return "stack:%d" % stack_offset
     representation = argument.get("repr")
     if isinstance(representation, str) and representation and argument.get("kind") != "constant":
-        return "repr:%s" % representation
+        return REPR_ID % representation
+    return None
+
+
+def _ram_global(text: object) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _RAM_RE.search(text)
+    return GLOBAL_ID % match.group(1).lower() if match else None
+
+
+def _loaded_pointer_global(ptr: object) -> str | None:
+    if not isinstance(ptr, dict):
+        return None
+    if ptr.get("kind") == "address_constant" and ptr.get("address"):
+        return GLOBAL_ID % str(ptr["address"]).lower()
+    if ptr.get("kind") == "constant" and isinstance(ptr.get("value"), int):
+        return "global:0x%x" % ptr["value"]
+    return _ram_global(ptr.get("repr"))
+
+
+def _load_node_global(node: dict, inputs: list) -> str | None:
+    if node.get("op") == "LOAD" and len(inputs) >= 2:
+        return _loaded_pointer_global(inputs[1])
+    return None
+
+
+def _nested_expressions(inputs: list) -> list:
+    return [inp["expression"] for inp in inputs if isinstance(inp, dict) and isinstance(inp.get("expression"), dict)]
+
+
+def _expression_global(expr: dict) -> str | None:
+    pending = [expr]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), list) else []
+        found = _load_node_global(node, inputs)
+        if found is not None:
+            return found
+        pending.extend(_nested_expressions(inputs))
     return None
 
 
@@ -225,41 +273,12 @@ def _global_identity(argument: dict) -> str | None:
     if not isinstance(argument, dict):
         return None
     if argument.get("kind") == "address_constant" and argument.get("writable") is True and argument.get("address"):
-        return "global:%s" % str(argument["address"]).lower()
-    repr_text = argument.get("repr")
-    if isinstance(repr_text, str):
-        match = _RAM_RE.search(repr_text)
-        if match:
-            return "global:%s" % match.group(1).lower()
+        return GLOBAL_ID % str(argument["address"]).lower()
+    found = _ram_global(argument.get("repr"))
+    if found is not None:
+        return found
     expr = argument.get("expression")
-    if isinstance(expr, dict):
-        pending = [expr]
-        seen: set[int] = set()
-        while pending:
-            node = pending.pop()
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-            op = node.get("op")
-            inputs = node.get("inputs") if isinstance(node.get("inputs"), list) else []
-            if op == "LOAD" and len(inputs) >= 2:
-                ptr = inputs[1]
-                if isinstance(ptr, dict):
-                    if ptr.get("kind") == "address_constant" and ptr.get("address"):
-                        return "global:%s" % str(ptr["address"]).lower()
-                    if ptr.get("kind") == "constant" and isinstance(ptr.get("value"), int):
-                        return "global:0x%x" % ptr["value"]
-                    ptr_repr = ptr.get("repr")
-                    if isinstance(ptr_repr, str):
-                        match = _RAM_RE.search(ptr_repr)
-                        if match:
-                            return "global:%s" % match.group(1).lower()
-            for inp in inputs:
-                if isinstance(inp, dict):
-                    nested = inp.get("expression")
-                    if isinstance(nested, dict):
-                        pending.append(nested)
-    return None
+    return _expression_global(expr) if isinstance(expr, dict) else None
 
 
 def _can_reach_call(cfg: dict, function: str, src: dict, dst: dict) -> bool:
@@ -273,19 +292,7 @@ def _can_reach_call(cfg: dict, function: str, src: dict, dst: dict) -> bool:
             src_key = (src.get("order", _call_sort_key(src)), _call_sort_key(src))
             dst_key = (dst.get("order", _call_sort_key(dst)), _call_sort_key(dst))
             return src_key < dst_key
-        visited: set[int] = {src_block}
-        queue: list[int] = [src_block]
-        while queue:
-            current = queue.pop(0)
-            for nxt in blocks.get(str(current), []):
-                if not isinstance(nxt, int):
-                    continue
-                if nxt == dst_block:
-                    return True
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append(nxt)
-        return False
+        return _block_can_reach(blocks, src_block, dst_block)
     return _call_sort_key(src) < _call_sort_key(dst)
 
 
@@ -356,63 +363,91 @@ def _guard_strings(calls: Sequence[dict]) -> dict[str, list[tuple[dict, str]]]:
 ALLOCATORS = {"malloc", "calloc", "realloc", "aligned_alloc", "memalign", "posix_memalign", "strdup", "strndup", "operator new", "operator new[]", "new"}
 
 
+@dataclass
+class _HeapState:
+    cfg: dict
+    guards: dict
+    flag_opens: dict
+    freed: dict = field(default_factory=dict)
+    global_freed: dict = field(default_factory=dict)
+    double_free: list = field(default_factory=list)
+    use_after_free: list = field(default_factory=list)
+    flag_notes: list = field(default_factory=list)
+
+
+def _intervening_guard(state: _HeapState, function: str, previous: dict, call: dict) -> Optional[tuple[dict, str]]:
+    for guard_call, guard_text in state.guards.get(function, []):
+        if _can_reach_call(state.cfg, function, previous, guard_call) and _can_reach_call(state.cfg, function, guard_call, call):
+            return guard_call, guard_text
+    return None
+
+
+def _record_freed_use(state: _HeapState, call: dict, function: str, name: str, index: int, identity: Optional[str], previous: dict) -> None:
+    entry = "%s passes freed %s to %s argument %d at %s; free at %s" % (
+        function, identity, name, index, call.get("from"), previous.get("from"),
+    )
+    guard = _intervening_guard(state, function, previous, call)
+    if guard is not None:
+        entry = GUARDED_PREFIX + entry + "; guard string %r at %s intervenes between free and use" % (guard[1], guard[0].get("from"))
+    state.use_after_free.append(entry)
+    for open_call, path in state.flag_opens.get(function, []):
+        state.flag_notes.append(
+            "flag file %r opened at %s in %s; buffer %s freed at %s and reused by %s at %s may alias the flag buffer"
+            % (path, open_call.get("from"), function, identity, previous.get("from"), name, call.get("from"))
+        )
+
+
+def _record_global_use(state: _HeapState, call: dict, function: str, name: str, index: int, arg: dict) -> None:
+    global_id = _global_identity(arg)
+    if global_id is None:
+        return
+    for free_fn, free_call in state.global_freed.get(global_id, []):
+        if free_fn != function:
+            state.use_after_free.append(
+                "%s passes global %s (freed in %s at %s) to %s argument %d at %s"
+                % (function, global_id, free_fn, free_call.get("from"), name, index, call.get("from"))
+            )
+
+
+def _record_dereferences(state: _HeapState, call: dict, function: str, name: str) -> None:
+    for index in HEAP_DEREFERENCE_ARGUMENTS.get(name, set()):
+        arg = _call_argument(call, index)
+        identity = _argument_identity(arg)
+        previous = state.freed.get((function, identity or ""))
+        if previous is not None and _can_reach_call(state.cfg, function, previous, call):
+            _record_freed_use(state, call, function, name, index, identity, previous)
+        _record_global_use(state, call, function, name, index, arg)
+
+
+def _release_reassigned(state: _HeapState, call: dict, function: str, name: str) -> None:
+    if name not in ALLOCATORS:
+        return
+    reassigned = _return_var_identities(call)
+    if name == "posix_memalign":
+        out_id = _argument_identity(_call_argument(call, 0))
+        if out_id:
+            reassigned.add(out_id)
+    for rid in reassigned:
+        prev_free = state.freed.get((function, rid))
+        if prev_free is not None and _can_reach_call(state.cfg, function, prev_free, call):
+            del state.freed[(function, rid)]
+
+
 def _heap_lifetime_candidates(calls: Sequence[dict], cfg: dict | None = None) -> tuple[list[str], list[str], list[str]]:
-    cfg_map = cfg if isinstance(cfg, dict) else {}
-    double_free: list[str] = []
-    use_after_free: list[str] = []
-    flag_notes: list[str] = []
-    freed: dict[tuple[str, str], dict] = {}
-    global_freed: dict[str, list[tuple[str, dict]]] = {}
     ordered = sorted(calls, key=_call_position)
-    guards = _guard_strings(ordered)
-    flag_opens = _flag_open_calls(ordered)
+    state = _HeapState(cfg if isinstance(cfg, dict) else {}, _guard_strings(ordered), _flag_open_calls(ordered))
     for call in ordered:
         function = str(call.get("function") or UNKNOWN)
         name = _call_name(call)
         if name in DEALLOCATORS:
-            _record_free(call, function, freed, double_free, cfg_map, global_freed)
+            _record_free(call, function, state.freed, state.double_free, state.cfg, state.global_freed)
             continue
-        indexes = HEAP_DEREFERENCE_ARGUMENTS.get(name, set())
-        for index in indexes:
-            arg = _call_argument(call, index)
-            identity = _argument_identity(arg)
-            previous = freed.get((function, identity or ""))
-            if previous is not None and _can_reach_call(cfg_map, function, previous, call):
-                entry = "%s passes freed %s to %s argument %d at %s; free at %s" % (
-                    function, identity, name, index, call.get("from"), previous.get("from"),
-                )
-                for guard_call, guard_text in guards.get(function, []):
-                    if _can_reach_call(cfg_map, function, previous, guard_call) and _can_reach_call(cfg_map, function, guard_call, call):
-                        entry = "[guarded] " + entry + "; guard string %r at %s intervenes between free and use" % (guard_text, guard_call.get("from"))
-                        break
-                use_after_free.append(entry)
-                for open_call, path in flag_opens.get(function, []):
-                    flag_notes.append(
-                        "flag file %r opened at %s in %s; buffer %s freed at %s and reused by %s at %s may alias the flag buffer"
-                        % (path, open_call.get("from"), function, identity, previous.get("from"), name, call.get("from"))
-                    )
-            global_id = _global_identity(arg)
-            if global_id is not None:
-                for free_fn, free_call in global_freed.get(global_id, []):
-                    if free_fn != function:
-                        use_after_free.append(
-                            "%s passes global %s (freed in %s at %s) to %s argument %d at %s"
-                            % (function, global_id, free_fn, free_call.get("from"), name, index, call.get("from"))
-                        )
-        if name in ALLOCATORS:
-            reassigned = _return_var_identities(call)
-            if name == "posix_memalign":
-                out_id = _argument_identity(_call_argument(call, 0))
-                if out_id:
-                    reassigned.add(out_id)
-            for rid in reassigned:
-                prev_free = freed.get((function, rid))
-                if prev_free is not None and _can_reach_call(cfg_map, function, prev_free, call):
-                    del freed[(function, rid)]
+        _record_dereferences(state, call, function, name)
+        _release_reassigned(state, call, function, name)
     return (
-        sorted(set(double_free), key=str.lower),
-        sorted(set(use_after_free), key=lambda item: (item.startswith("[guarded] "), item.lower())),
-        sorted(set(flag_notes), key=str.lower),
+        sorted(set(state.double_free), key=str.lower),
+        sorted(set(state.use_after_free), key=lambda item: (item.startswith(GUARDED_PREFIX), item.lower())),
+        sorted(set(state.flag_notes), key=str.lower),
     )
 
 
@@ -591,32 +626,34 @@ def _block_can_reach(blocks: dict, src_block: int, dst_block: int) -> bool:
     return False
 
 
-def _has_bounds_guard(cfg: dict | None, call: dict, argument: dict) -> bool:
+def _guard_context(cfg: dict | None, call: dict) -> Optional[tuple[dict, list, int]]:
     if not isinstance(cfg, dict):
-        return False
-    function = str(call.get("function") or UNKNOWN)
-    fn_cfg = cfg.get(function)
+        return None
+    fn_cfg = cfg.get(str(call.get("function") or UNKNOWN))
     call_block = call.get("block")
     if not isinstance(fn_cfg, dict) or not isinstance(call_block, int):
-        return False
+        return None
     blocks = fn_cfg.get("blocks")
     guards = fn_cfg.get("guards")
     if not isinstance(blocks, dict) or not isinstance(guards, list):
+        return None
+    return blocks, guards, call_block
+
+
+def _guard_dominates(guard: object, arg_ids: set[str], blocks: dict, call_block: int) -> bool:
+    if not isinstance(guard, dict) or guard.get("op") not in BOUNDS_GUARD_OPS or guard.get("var") not in arg_ids:
         return False
+    guard_block = guard.get("block")
+    return isinstance(guard_block, int) and guard_block != call_block and _block_can_reach(blocks, guard_block, call_block)
+
+
+def _has_bounds_guard(cfg: dict | None, call: dict, argument: dict) -> bool:
+    context = _guard_context(cfg, call)
+    if context is None:
+        return False
+    blocks, guards, call_block = context
     arg_ids = _argument_identities_in_tree(argument)
-    if not arg_ids:
-        return False
-    for guard in guards:
-        if not isinstance(guard, dict):
-            continue
-        if guard.get("op") not in BOUNDS_GUARD_OPS:
-            continue
-        if guard.get("var") not in arg_ids:
-            continue
-        guard_block = guard.get("block")
-        if isinstance(guard_block, int) and guard_block != call_block and _block_can_reach(blocks, guard_block, call_block):
-            return True
-    return False
+    return bool(arg_ids) and any(_guard_dominates(guard, arg_ids, blocks, call_block) for guard in guards)
 
 
 def _check_integer_allocations(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
@@ -681,23 +718,31 @@ def _check_division(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     )
 
 
+def _length_indexes(name: str) -> tuple[int, ...]:
+    if name == "fread":
+        return (1, 2)
+    if name in BOUNDED_WRITES:
+        return (BOUNDED_WRITES[name][1],)
+    return ()
+
+
+def _unguarded_width_ops(call: dict, length_index: int, cfg: dict | None) -> Optional[list[str]]:
+    argument = _call_argument(call, length_index)
+    operations = _expression_ops(argument)
+    if not (operations & WIDTH_CHANGE_OPS) or not _expression_has_dynamic_input(argument):
+        return None
+    if _has_bounds_guard(cfg, call, argument):
+        return None
+    return sorted(operations & WIDTH_CHANGE_OPS)
+
+
 def _check_width_conversions(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
     width_changed_lengths = []
     for call in ghidra_calls:
-        name = _call_name(call)
-        if name == "fread":
-            length_indexes: tuple[int, ...] = (1, 2)
-        elif name in BOUNDED_WRITES:
-            length_indexes = (BOUNDED_WRITES[name][1],)
-        else:
-            continue
-        for length_index in length_indexes:
-            argument = _call_argument(call, length_index)
-            operations = _expression_ops(argument)
-            if (operations & WIDTH_CHANGE_OPS) and _expression_has_dynamic_input(argument):
-                if _has_bounds_guard(cfg, call, argument):
-                    continue
-                width_changed_lengths.append((call, length_index, sorted(operations & WIDTH_CHANGE_OPS)))
+        for length_index in _length_indexes(_call_name(call)):
+            ops = _unguarded_width_ops(call, length_index, cfg)
+            if ops is not None:
+                width_changed_lengths.append((call, length_index, ops))
     if not width_changed_lengths:
         return None
     return _finding(
@@ -733,8 +778,20 @@ def _return_var_identities(call: dict) -> set[str]:
         ids.add("high:%s" % high_name)
     repr_text = ret.get("repr")
     if isinstance(repr_text, str) and repr_text:
-        ids.add("repr:%s" % repr_text)
+        ids.add(REPR_ID % repr_text)
     return ids
+
+
+def _collect_input_identities(node: dict, ids: set[str], pending: list) -> None:
+    for inp in node.get("inputs", []):
+        if not isinstance(inp, dict):
+            continue
+        inp_id = _argument_identity(inp)
+        if inp_id:
+            ids.add(inp_id)
+        nested = inp.get("expression")
+        if isinstance(nested, dict):
+            pending.append(nested)
 
 
 def _argument_identities_in_tree(argument: dict) -> set[str]:
@@ -752,16 +809,24 @@ def _argument_identities_in_tree(argument: dict) -> set[str]:
         if id(node) in seen:
             continue
         seen.add(id(node))
-        for inp in node.get("inputs", []):
-            if not isinstance(inp, dict):
-                continue
-            inp_id = _argument_identity(inp)
-            if inp_id:
-                ids.add(inp_id)
-            nested = inp.get("expression")
-            if isinstance(nested, dict):
-                pending.append(nested)
+        _collect_input_identities(node, ids, pending)
     return ids
+
+
+def _snprintf_sink_hits(call: dict, function: str, name: str, cfg_map: dict, producers: list) -> list[str]:
+    hits: list[str] = []
+    for idx in SNPRINTF_LENGTH_SINKS.get(name, ()):
+        arg_ids = _argument_identities_in_tree(_call_argument(call, idx))
+        if not arg_ids:
+            continue
+        for prod_call, prod_ids in producers:
+            if (arg_ids & prod_ids) and _can_reach_call(cfg_map, function, prod_call, call):
+                hits.append(
+                    "%s passes %s return value from %s to %s argument %d at %s"
+                    % (function, _call_name(prod_call), prod_call.get("from"), name, idx, call.get("from"))
+                )
+                break
+    return hits
 
 
 def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
@@ -773,19 +838,7 @@ def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None
     for call in ordered:
         function = str(call.get("function") or UNKNOWN)
         name = _call_name(call)
-        sink_indexes = SNPRINTF_LENGTH_SINKS.get(name, ())
-        for idx in sink_indexes:
-            arg = _call_argument(call, idx)
-            arg_ids = _argument_identities_in_tree(arg)
-            if not arg_ids:
-                continue
-            for prod_call, prod_ids in producers.get(function, []):
-                if (arg_ids & prod_ids) and _can_reach_call(cfg_map, function, prod_call, call):
-                    hits.append(
-                        "%s passes %s return value from %s to %s argument %d at %s"
-                        % (function, _call_name(prod_call), prod_call.get("from"), name, idx, call.get("from"))
-                    )
-                    break
+        hits.extend(_snprintf_sink_hits(call, function, name, cfg_map, producers.get(function, [])))
         if name in SNPRINTF_NAMES:
             ret_ids = _return_var_identities(call)
             if ret_ids:
@@ -812,7 +865,7 @@ def _check_heap_lifetime(ghidra_calls: Sequence[dict], cfg: dict | None = None) 
             "Give each allocation one owner and clear or transfer the pointer after free.",
         ))
     if use_after_free:
-        flag_path = "Manual confirmation required before a flag-recovery payload exists."
+        flag_path = NO_FLAG_PATH
         if flag_notes:
             flag_path = (
                 "Leak the flag buffer through the reported use-after-free: %s. "
@@ -830,29 +883,33 @@ def _check_heap_lifetime(ghidra_calls: Sequence[dict], cfg: dict | None = None) 
     return findings
 
 
+def _classify_indirect_call(call: dict) -> Optional[tuple[str, str]]:
+    if call.get("indirect") is not True:
+        return None
+    target = call.get("target") if isinstance(call.get("target"), dict) else {}
+    function = call.get("function") or UNKNOWN
+    is_stack = target.get("kind") == "stack"
+    if not is_stack and function in CRT_FUNCTIONS:
+        return None
+    entry = "indirect call at %s in %s; target %s" % (
+        call.get("from"), function,
+        _argument_identity(target) or target.get("repr") or "not recovered",
+    )
+    if is_stack:
+        return "stack", entry
+    if "LOAD" in _expression_ops(target):
+        return "loaded", entry
+    return "other", entry
+
+
 def _check_indirect_calls(ghidra_calls: Sequence[dict]) -> List[Finding]:
     findings: List[Finding] = []
-    stack_indirect = []
-    loaded_indirect = []
-    other_indirect = []
+    buckets: dict[str, list[str]] = {"stack": [], "loaded": [], "other": []}
     for call in ghidra_calls:
-        if call.get("indirect") is not True:
-            continue
-        target = call.get("target") if isinstance(call.get("target"), dict) else {}
-        function = call.get("function") or UNKNOWN
-        is_stack = target.get("kind") == "stack"
-        if not is_stack and function in CRT_FUNCTIONS:
-            continue
-        entry = "indirect call at %s in %s; target %s" % (
-            call.get("from"), function,
-            _argument_identity(target) or target.get("repr") or "not recovered",
-        )
-        if is_stack:
-            stack_indirect.append(entry)
-        elif "LOAD" in _expression_ops(target):
-            loaded_indirect.append(entry)
-        else:
-            other_indirect.append(entry)
+        classified = _classify_indirect_call(call)
+        if classified is not None:
+            buckets[classified[0]].append(classified[1])
+    stack_indirect, loaded_indirect, other_indirect = buckets["stack"], buckets["loaded"], buckets["other"]
     if stack_indirect:
         findings.append(_finding(
             "PWN-CFLOW-001", "Stack-derived indirect call target", "high", "high", stack_indirect,
@@ -911,6 +968,14 @@ def _check_syscall_filter(info: BinaryInfo) -> Optional[Finding]:
     )
 
 
+def _scanf_width_overflows(call: dict, dest_index: int, width_text: str) -> bool:
+    if not width_text:
+        return True
+    dest = _call_argument(call, dest_index)
+    capacity = dest.get("buffer_size") or dest.get("return_address_offset")
+    return isinstance(capacity, int) and capacity > 0 and int(width_text) + 1 > capacity
+
+
 def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
     format_arg = _call_argument(call, format_index)
     format_str = format_arg.get("string") if format_arg.get("kind") == "address_constant" else None
@@ -921,14 +986,8 @@ def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
         suppressed, width_text, conversion = match.groups()
         if suppressed:
             continue
-        if conversion in {"s", "["}:
-            if not width_text:
-                return False
-            width = int(width_text)
-            dest = _call_argument(call, dest_index)
-            capacity = dest.get("buffer_size") or dest.get("return_address_offset")
-            if isinstance(capacity, int) and capacity > 0 and width + 1 > capacity:
-                return False
+        if conversion in {"s", "["} and _scanf_width_overflows(call, dest_index, width_text):
+            return False
         dest_index += 1
     return True
 
@@ -984,36 +1043,46 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
     )
 
 
-def _format_input_sources(ghidra_calls: Sequence[dict]) -> dict[int, str]:
-    """Map id() of a dynamic format call to evidence of the input call filling its format buffer."""
+def _format_fillers(ghidra_calls: Sequence[dict]) -> list[tuple[str, str, dict]]:
     fillers: list[tuple[str, str, dict]] = []
     for call in ghidra_calls:
         name = _call_name(call)
-        if name in INPUT_FILLERS:
-            dest = _call_argument(call, INPUT_FILLERS[name])
-            identity = _argument_identity(dest)
-            if identity is not None:
-                fillers.append((str(call.get("function") or UNKNOWN), identity, call))
+        if name not in INPUT_FILLERS:
+            continue
+        identity = _argument_identity(_call_argument(call, INPUT_FILLERS[name]))
+        if identity is not None:
+            fillers.append((str(call.get("function") or UNKNOWN), identity, call))
+    return fillers
+
+
+def _filler_evidence(call: dict, fillers: list[tuple[str, str, dict]]) -> Optional[str]:
+    argument = _call_argument(call, FORMAT_INDEXES[_call_name(call)])
+    if not _dynamic_argument(argument):
+        return None
+    identity = _argument_identity(argument)
+    if identity is None:
+        return None
+    function = str(call.get("function") or UNKNOWN)
+    for filler_function, filler_identity, filler_call in fillers:
+        if filler_function == function and filler_identity == identity:
+            length = _call_argument(filler_call, 2).get("value") if _call_name(filler_call) in {"read", "recv", "recvfrom"} else None
+            detail = " (%d bytes)" % length if isinstance(length, int) else ""
+            return "format argument at %s is the buffer filled by %s at %s%s" % (
+                call.get("from"), _call_name(filler_call), filler_call.get("from"), detail,
+            )
+    return None
+
+
+def _format_input_sources(ghidra_calls: Sequence[dict]) -> dict[int, str]:
+    """Map id() of a dynamic format call to evidence of the input call filling its format buffer."""
+    fillers = _format_fillers(ghidra_calls)
     sources: dict[int, str] = {}
     for call in ghidra_calls:
         if _call_name(call) not in FORMAT_INDEXES:
             continue
-        argument = _call_argument(call, FORMAT_INDEXES[_call_name(call)])
-        if not _dynamic_argument(argument):
-            continue
-        identity = _argument_identity(argument)
-        if identity is None:
-            continue
-        function = str(call.get("function") or UNKNOWN)
-        for filler_function, filler_identity, filler_call in fillers:
-            if filler_function == function and filler_identity == identity:
-                length = _call_argument(filler_call, 2).get("value") if _call_name(filler_call) in {"read", "recv", "recvfrom"} else None
-                detail = " (%d bytes)" % length if isinstance(length, int) else ""
-                sources[id(call)] = (
-                    "format argument at %s is the buffer filled by %s at %s%s"
-                    % (call.get("from"), _call_name(filler_call), filler_call.get("from"), detail)
-                )
-                break
+        evidence = _filler_evidence(call, fillers)
+        if evidence is not None:
+            sources[id(call)] = evidence
     return sources
 
 
@@ -1148,7 +1217,7 @@ def _check_win_paths(info: BinaryInfo, bounded: Sequence[dict], symbols: set[str
             "Reach the success routine through a corrupted return address, function pointer, or intended state transition. " + address_note,
             ["Cross-reference each clue.", "List callers and guard conditions for candidate success routines."],
             "Remove dormant privileged paths and keep secrets outside the challenge binary in production software.",
-            flag_path=flag_output_path or "Manual confirmation required before a flag-recovery payload exists.",
+            flag_path=flag_output_path or NO_FLAG_PATH,
         ))
     return findings
 
@@ -1172,26 +1241,25 @@ def _check_mitigations(info: BinaryInfo) -> Optional[Finding]:
     )
 
 
+def _note_stream_identity(function: str, argument: dict, local_streams: set, global_streams: set) -> None:
+    identity = _argument_identity(argument)
+    if identity is None:
+        return
+    local_streams.add((function, identity))
+    repr_text = argument.get("repr")
+    if identity.startswith("high:"):
+        global_streams.add(identity)
+    if isinstance(repr_text, str) and repr_text.startswith("(ram,"):
+        global_streams.add(REPR_ID % repr_text)
+
+
 def _collect_file_stream_identities(ghidra_calls: Sequence[dict]) -> tuple[set[tuple[str, str]], set[str]]:
     local_streams: set[tuple[str, str]] = set()
     global_streams: set[str] = set()
     for call in ghidra_calls:
-        name = _call_name(call)
-        indexes = FILE_STREAM_ARGS.get(name, set())
-        if not indexes:
-            continue
         function = str(call.get("function") or UNKNOWN)
-        for index in indexes:
-            argument = _call_argument(call, index)
-            identity = _argument_identity(argument)
-            if identity is None:
-                continue
-            local_streams.add((function, identity))
-            repr_text = argument.get("repr")
-            if identity.startswith("high:"):
-                global_streams.add(identity)
-            if isinstance(repr_text, str) and repr_text.startswith("(ram,"):
-                global_streams.add("repr:%s" % repr_text)
+        for index in FILE_STREAM_ARGS.get(_call_name(call), set()):
+            _note_stream_identity(function, _call_argument(call, index), local_streams, global_streams)
     return local_streams, global_streams
 
 
@@ -1202,7 +1270,49 @@ def _is_file_stream_argument(argument: dict, function: str, local_streams: set[t
     if identity is not None and ((function, identity) in local_streams or identity in global_streams):
         return True
     repr_text = argument.get("repr")
-    return isinstance(repr_text, str) and ("repr:%s" % repr_text) in global_streams
+    return isinstance(repr_text, str) and (REPR_ID % repr_text) in global_streams
+
+
+def _file_write_evidence(call: dict, name: str, function: str, local_streams: set, global_streams: set) -> Optional[str]:
+    if name not in FILE_WRITE_DESTS:
+        return None
+    dst = _call_argument(call, FILE_WRITE_DESTS[name])
+    if not _is_file_stream_argument(dst, function, local_streams, global_streams):
+        return None
+    label = dst.get("high_name") if dst.get("high_name") not in {None, "UNNAMED", "null"} else (_argument_identity(dst) or "FILE*")
+    return "Ghidra call %s at %s in %s writes into FILE stream %s" % (name, call.get("from"), function, label)
+
+
+def _note_fclose(call: dict, function: str, closed: dict, global_closed: dict) -> None:
+    arg0 = _call_argument(call, 0)
+    identity = _argument_identity(arg0)
+    if identity is not None:
+        closed.setdefault((function, identity), call)
+    global_id = _global_identity(arg0)
+    if global_id is not None:
+        global_closed.setdefault(global_id, []).append((function, call))
+
+
+def _global_close_evidence(call: dict, name: str, function: str, global_id: Optional[str], global_closed: dict) -> list[str]:
+    if global_id is None:
+        return []
+    return [
+        "%s uses global FILE stream %s in %s at %s (closed in %s at %s)" % (name, global_id, function, call.get("from"), close_fn, close_call.get("from"))
+        for close_fn, close_call in global_closed.get(global_id, [])
+        if close_fn != function
+    ]
+
+
+def _stream_use_evidence(call: dict, name: str, function: str, closed: dict, global_closed: dict, cfg_map: dict) -> list[str]:
+    result: list[str] = []
+    for index in FILE_STREAM_ARGS[name]:
+        arg = _call_argument(call, index)
+        identity = _argument_identity(arg)
+        previous = closed.get((function, identity or ""))
+        if previous is not None and _can_reach_call(cfg_map, function, previous, call):
+            result.append("%s uses FILE stream %s in %s at %s after fclose at %s" % (name, identity, function, call.get("from"), previous.get("from")))
+        result.extend(_global_close_evidence(call, name, function, _global_identity(arg), global_closed))
+    return result
 
 
 def _check_file_streams(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
@@ -1214,31 +1324,13 @@ def _check_file_streams(ghidra_calls: Sequence[dict], cfg: dict | None = None) -
     for call in sorted(ghidra_calls, key=_call_position):
         name = _call_name(call)
         function = str(call.get("function") or UNKNOWN)
-        if name in FILE_WRITE_DESTS:
-            dst = _call_argument(call, FILE_WRITE_DESTS[name])
-            if _is_file_stream_argument(dst, function, local_streams, global_streams):
-                label = dst.get("high_name") if dst.get("high_name") not in {None, "UNNAMED", "null"} else (_argument_identity(dst) or "FILE*")
-                evidence.append("Ghidra call %s at %s in %s writes into FILE stream %s" % (name, call.get("from"), function, label))
+        write = _file_write_evidence(call, name, function, local_streams, global_streams)
+        if write is not None:
+            evidence.append(write)
         if name == "fclose":
-            arg0 = _call_argument(call, 0)
-            identity = _argument_identity(arg0)
-            if identity is not None:
-                closed.setdefault((function, identity), call)
-            global_id = _global_identity(arg0)
-            if global_id is not None:
-                global_closed.setdefault(global_id, []).append((function, call))
+            _note_fclose(call, function, closed, global_closed)
         elif name in FILE_STREAM_ARGS and name not in {"setbuf", "setvbuf"}:
-            for index in FILE_STREAM_ARGS[name]:
-                arg = _call_argument(call, index)
-                identity = _argument_identity(arg)
-                previous = closed.get((function, identity or ""))
-                if previous is not None and _can_reach_call(cfg_map, function, previous, call):
-                    evidence.append("%s uses FILE stream %s in %s at %s after fclose at %s" % (name, identity, function, call.get("from"), previous.get("from")))
-                global_id = _global_identity(arg)
-                if global_id is not None:
-                    for close_fn, close_call in global_closed.get(global_id, []):
-                        if close_fn != function:
-                            evidence.append("%s uses global FILE stream %s in %s at %s (closed in %s at %s)" % (name, global_id, function, call.get("from"), close_fn, close_call.get("from")))
+            evidence.extend(_stream_use_evidence(call, name, function, closed, global_closed, cfg_map))
     if not evidence:
         return None
     return _finding(
@@ -1376,58 +1468,73 @@ def _resolve_ghidra_calls(calls: Sequence[object], plt_addresses: dict, ghidra_b
     return sorted(resolved, key=lambda item: (str(item.get("to", "")), str(item.get("from", ""))))
 
 
-def _fill_missing_strings(resolved_calls: Sequence[dict], string_addresses: object, ghidra_base: int) -> None:
-    if not isinstance(string_addresses, dict) or not string_addresses:
-        return
+def _string_address_map(string_addresses: object) -> dict[int, str]:
     address_to_string: dict[int, str] = {}
+    if not isinstance(string_addresses, dict):
+        return address_to_string
     for text, addresses in string_addresses.items():
         if isinstance(text, str) and isinstance(addresses, list):
             for address in addresses:
                 if isinstance(address, int):
                     address_to_string[address] = text
+    return address_to_string
+
+
+def _string_for_argument(argument: object, address_to_string: dict[int, str], ghidra_base: int) -> Optional[str]:
+    if not isinstance(argument, dict) or argument.get("kind") != "address_constant" or argument.get("string"):
+        return None
+    try:
+        address = int(str(argument.get("address")), 16)
+    except (TypeError, ValueError):
+        return None
+    candidates = [address]
+    if ghidra_base and address >= ghidra_base:
+        candidates.append(address - ghidra_base)
+    for candidate in candidates:
+        if candidate in address_to_string:
+            return address_to_string[candidate]
+    return None
+
+
+def _arguments_with_strings(arguments: list, address_to_string: dict[int, str], ghidra_base: int) -> Optional[list]:
+    updated_args = None
+    for index, argument in enumerate(arguments):
+        text = _string_for_argument(argument, address_to_string, ghidra_base)
+        if text is None:
+            continue
+        if updated_args is None:
+            updated_args = list(arguments)
+        updated_args[index] = {**argument, "string": text}
+    return updated_args
+
+
+def _fill_missing_strings(resolved_calls: Sequence[dict], string_addresses: object, ghidra_base: int) -> None:
+    address_to_string = _string_address_map(string_addresses)
     if not address_to_string:
         return
     for call in resolved_calls:
         arguments = call.get("arguments")
         if not isinstance(arguments, list):
             continue
-        updated_args = None
-        for index, argument in enumerate(arguments):
-            if not isinstance(argument, dict) or argument.get("kind") != "address_constant" or argument.get("string"):
-                continue
-            try:
-                address = int(str(argument.get("address")), 16)
-            except (TypeError, ValueError):
-                continue
-            candidates = [address]
-            if ghidra_base and address >= ghidra_base:
-                candidates.append(address - ghidra_base)
-            for candidate in candidates:
-                if candidate in address_to_string:
-                    if updated_args is None:
-                        updated_args = list(arguments)
-                    updated_args[index] = {**argument, "string": address_to_string[candidate]}
-                    break
+        updated_args = _arguments_with_strings(arguments, address_to_string, ghidra_base)
         if updated_args is not None:
             call["arguments"] = updated_args
 
 
-def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
+def _read_ghidra_payload(export_path: Path) -> dict:
     try:
         payload = json.loads(export_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid Ghidra export: %s" % exc) from exc
     if payload.get("schema") != "pwnscan-ghidra/v1":
         raise ValueError("invalid Ghidra export schema")
-    functions = payload.get("functions")
-    imports = payload.get("imports")
-    calls = payload.get("calls", [])
-    if not isinstance(functions, list) or not isinstance(imports, list) or not isinstance(calls, list):
+    if not (isinstance(payload.get("functions"), list) and isinstance(payload.get("imports"), list) and isinstance(payload.get("calls", []), list)):
         raise ValueError("invalid Ghidra export structure")
-    function_names = {item.get("name") for item in functions if isinstance(item, dict) and isinstance(item.get("name"), str)}
-    clean_imports = {_normalize_import_name(value) for value in imports if isinstance(value, str)}
-    metadata = dict(info.metadata)
-    addresses = dict(metadata.get("symbol_addresses", {}))
+    return payload
+
+
+def _merge_function_addresses(functions: list, existing: dict) -> dict:
+    addresses = dict(existing)
     for item in functions:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("entry"), str):
             continue
@@ -1435,17 +1542,30 @@ def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
             addresses[item["name"]] = int(item["entry"], 16)
         except ValueError:
             continue
-    metadata["symbol_addresses"] = {name: addresses[name] for name in sorted(addresses, key=str.lower)}
+    return {name: addresses[name] for name in sorted(addresses, key=str.lower)}
+
+
+def _ghidra_image_base(payload: dict) -> int:
+    try:
+        return int(payload["image_base"], 16) if isinstance(payload.get("image_base"), str) else 0
+    except ValueError:
+        return 0
+
+
+def _merge_ghidra(info: BinaryInfo, export_path: Path) -> BinaryInfo:
+    payload = _read_ghidra_payload(export_path)
+    functions = payload["functions"]
+    imports = payload["imports"]
+    calls = payload.get("calls", [])
+    function_names = {item.get("name") for item in functions if isinstance(item, dict) and isinstance(item.get("name"), str)}
+    clean_imports = {_normalize_import_name(value) for value in imports if isinstance(value, str)}
+    metadata = dict(info.metadata)
+    metadata["symbol_addresses"] = _merge_function_addresses(functions, metadata.get("symbol_addresses", {}))
     if "function_symbols" in metadata or function_names:
         merged_funcs = set(metadata.get("function_symbols", [])) | function_names
         metadata["function_symbols"] = sorted(merged_funcs, key=lambda value: (value.lower(), value))
     plt_addresses = metadata.get("plt_addresses", {})
-    ghidra_base = 0
-    if isinstance(payload.get("image_base"), str):
-        try:
-            ghidra_base = int(payload["image_base"], 16)
-        except ValueError:
-            ghidra_base = 0
+    ghidra_base = _ghidra_image_base(payload)
     resolved_calls = _resolve_ghidra_calls(calls, plt_addresses if isinstance(plt_addresses, dict) else {}, ghidra_base)
     _fill_missing_strings(resolved_calls, metadata.get("string_addresses"), ghidra_base)
     metadata["ghidra"] = {

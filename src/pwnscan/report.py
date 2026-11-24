@@ -6,7 +6,7 @@ import shutil
 import sys
 import textwrap
 
-from .model import ScanReport
+from .model import GUARDED_PREFIX, ScanReport
 
 COLORS = {"critical": "\033[1;31m", "high": "\033[31m", "medium": "\033[33m", "low": "\033[36m", "info": "\033[2m"}
 RESET = "\033[0m"
@@ -62,26 +62,30 @@ def render_text(report: ScanReport, color: bool = False, width: int | None = Non
         "findings: " + _summary(report.findings),
         "",
     ]
-    rule_line = (DIM + RULE + RESET) if color else RULE
     for finding in report.findings:
-        label = "[%s] %s %s" % (finding.severity.upper(), finding.id, finding.title)
-        if color:
-            label = COLORS[finding.severity] + label + RESET
-        lines.extend([rule_line, label])
-        conf_color = CONFIDENCE_COLORS.get(finding.confidence, "") if color else ""
-        exploit_color = BOLD_GREEN if (color and finding.exploit_status == "payload-ready") else ""
-        lines.append(_field("confidence", finding.confidence, wrap_at, color=color, value_color=conf_color))
-        lines.append(_field("exploit", finding.exploit_status, wrap_at, color=color, value_color=exploit_color))
-        lines.append(_field("flag path", finding.flag_path, wrap_at, color=color))
-        for evidence in finding.evidence:
-            ev_color = DIM if (color and evidence.startswith("[guarded] ")) else ""
-            lines.append(_field("evidence", evidence, wrap_at, color=color, value_color=ev_color))
-        lines.append(_field("vector", finding.attack_vector, wrap_at, color=color))
-        for step in finding.validation:
-            lines.append(_field("validate", step, wrap_at, color=color))
-        lines.append(_field("patch", finding.patch, wrap_at, color=color))
-        lines.append("")
+        lines.extend(_render_finding(finding, color, wrap_at))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_finding(finding, color: bool, wrap_at: int) -> list:
+    label = "[%s] %s %s" % (finding.severity.upper(), finding.id, finding.title)
+    if color:
+        label = COLORS[finding.severity] + label + RESET
+    lines = [(DIM + RULE + RESET) if color else RULE, label]
+    conf_color = CONFIDENCE_COLORS.get(finding.confidence, "") if color else ""
+    exploit_color = BOLD_GREEN if (color and finding.exploit_status == "payload-ready") else ""
+    lines.extend([
+        _field("confidence", finding.confidence, wrap_at, color=color, value_color=conf_color),
+        _field("exploit", finding.exploit_status, wrap_at, color=color, value_color=exploit_color),
+        _field("flag path", finding.flag_path, wrap_at, color=color),
+    ])
+    for evidence in finding.evidence:
+        ev_color = DIM if (color and evidence.startswith(GUARDED_PREFIX)) else ""
+        lines.append(_field("evidence", evidence, wrap_at, color=color, value_color=ev_color))
+    lines.append(_field("vector", finding.attack_vector, wrap_at, color=color))
+    lines.extend(_field("validate", step, wrap_at, color=color) for step in finding.validation)
+    lines.extend([_field("patch", finding.patch, wrap_at, color=color), ""])
+    return lines
 
 
 def _field(key: str, value: str, width: int = 100, color: bool = False, value_color: str = "") -> str:

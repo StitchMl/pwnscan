@@ -640,21 +640,32 @@ def _pe_flag(dll_chars: Optional[int], mask: int) -> Optional[bool]:
     return None if dll_chars is None else bool(dll_chars & mask)
 
 
+def _pe_load_config_cookie(
+    data: bytes, bits: int, opt: int, optional_size: int, data_dir_off: int,
+    sections: Sequence[Tuple[str, int, int, int, int, int]], first_section_va: int,
+) -> Optional[bool]:
+    if data_dir_off + 88 > optional_size:
+        return None
+    load_cfg_rva = _u(data, opt + data_dir_off + 80, "I")
+    load_cfg_size = _u(data, opt + data_dir_off + 84, "I")
+    min_cfg_size = 64 if bits == 32 else 96
+    if not load_cfg_rva or load_cfg_size < min_cfg_size:
+        return None
+    off = _pe_rva_to_offset(data, sections, first_section_va, load_cfg_rva)
+    if off is None or off + min_cfg_size > len(data):
+        return None
+    cookie_at = off + (60 if bits == 32 else 88)
+    return _u(data, cookie_at, "I" if bits == 32 else "Q") != 0
+
+
 def _pe_stack_canary(
     data: bytes, bits: int, opt: int, optional_size: int, data_dir_off: int,
     sections: Sequence[Tuple[str, int, int, int, int, int]], first_section_va: int,
     strings: Sequence[str], parsed_imports: Sequence[str],
 ) -> Optional[bool]:
-    if data_dir_off + 88 <= optional_size:
-        load_cfg_rva = _u(data, opt + data_dir_off + 80, "I")
-        load_cfg_size = _u(data, opt + data_dir_off + 84, "I")
-        min_cfg_size = 64 if bits == 32 else 96
-        if load_cfg_rva and load_cfg_size >= min_cfg_size:
-            off = _pe_rva_to_offset(data, sections, first_section_va, load_cfg_rva)
-            if off is not None and off + min_cfg_size <= len(data):
-                cookie_at = off + (60 if bits == 32 else 88)
-                cookie = _u(data, cookie_at, "I" if bits == 32 else "Q")
-                return cookie != 0
+    cookie = _pe_load_config_cookie(data, bits, opt, optional_size, data_dir_off, sections, first_section_va)
+    if cookie is not None:
+        return cookie
     if any(name in {"__security_cookie", "__report_gsfailure"} for name in parsed_imports) or any(
         "__security_cookie" in value or "__report_gsfailure" in value for value in strings
     ):
@@ -757,11 +768,24 @@ def parse_pe(data: bytes) -> BinaryInfo:
 MACH_CPU = {7: "x86", 0x01000007: "x86_64", 12: "arm", 0x0100000C: "aarch64"}
 
 
+def _macho_is_undefined(n_type: int, n_sect: int) -> bool:
+    return (n_type & 0x0E) == 0x0 and bool(n_type & 0x01) and n_sect == 0
+
+
 def _macho_record_symbol(name: str, n_type: int, n_sect: int, n_value: int, undefined: Set[str], addresses: Dict[str, int]) -> None:
-    if (n_type & 0x0E) == 0x0 and (n_type & 0x01) and n_sect == 0:
+    if _macho_is_undefined(n_type, n_sect):
         undefined.add(name)
     elif (n_type & 0x0E) == 0x0E and n_value and (name not in addresses or n_value < addresses[name]):
         addresses[name] = n_value
+
+
+def _macho_clean_name(data: bytes, stroff: int, str_end: int, n_strx: int, n_type: int) -> Optional[str]:
+    if n_type & 0xE0 or stroff + n_strx >= str_end:
+        return None
+    raw_name = _c_string(data, stroff + n_strx)
+    if not raw_name:
+        return None
+    return raw_name[1:] if raw_name.startswith("_") else raw_name
 
 
 def _macho_symtab(data: bytes, bits: int, endian: str, at: int) -> Tuple[Set[str], Set[str], Dict[str, int], List[str]]:
@@ -783,14 +807,11 @@ def _macho_symtab(data: bytes, bits: int, endian: str, at: int) -> Tuple[Set[str
         n_type = data[sym_at + 4]
         n_sect = data[sym_at + 5]
         n_value = _u(data, sym_at + 8, value_fmt, endian)
-        if n_type & 0xE0 or stroff + n_strx >= str_end:
+        clean_name = _macho_clean_name(data, stroff, str_end, n_strx, n_type)
+        if clean_name is None:
             continue
-        raw_name = _c_string(data, stroff + n_strx)
-        if not raw_name:
-            continue
-        clean_name = raw_name[1:] if raw_name.startswith("_") else raw_name
         symbols.add(clean_name)
-        if (n_type & 0x0E) == 0x0 and (n_type & 0x01) and n_sect == 0 and clean_name not in undefined:
+        if _macho_is_undefined(n_type, n_sect) and clean_name not in undefined:
             undefined_ordered.append(clean_name)
         _macho_record_symbol(clean_name, n_type, n_sect, n_value, undefined, addresses)
     return symbols, undefined, addresses, undefined_ordered
@@ -814,6 +835,18 @@ class _MachoScan:
 S_SYMBOL_STUBS = 0x08
 
 
+def _macho_stub_section(data: bytes, endian: str, base: int, wide: bool) -> Optional[Tuple[int, int, int]]:
+    addr_fmt = "Q" if wide else "I"
+    sectname = data[base:base + 16].split(b"\0", 1)[0].decode("ascii", "replace")
+    addr = _u(data, base + 32, addr_fmt, endian)
+    size = _u(data, base + (40 if wide else 36), addr_fmt, endian)
+    flags = _u(data, base + (64 if wide else 56), "I", endian)
+    reserved2 = _u(data, base + (72 if wide else 60), "I", endian)
+    if sectname == "__stubs" and (flags & 0xFF) == S_SYMBOL_STUBS and reserved2 > 0:
+        return addr, size, reserved2
+    return None
+
+
 def _macho_segment_sections(data: bytes, endian: str, at: int, wide: bool, scan: _MachoScan) -> None:
     nsects_at = at + (64 if wide else 48)
     sect_at = at + (72 if wide else 56)
@@ -821,18 +854,13 @@ def _macho_segment_sections(data: bytes, endian: str, at: int, wide: bool, scan:
     if nsects_at + 4 > len(data):
         return
     nsects = _u(data, nsects_at, "I", endian)
-    addr_fmt = "Q" if wide else "I"
     for index in range(min(nsects, 255)):
         base = sect_at + index * sect_size
         if base + sect_size > len(data):
             break
-        sectname = data[base:base + 16].split(b"\0", 1)[0].decode("ascii", "replace")
-        addr = _u(data, base + 32, addr_fmt, endian)
-        size = _u(data, base + (40 if wide else 36), addr_fmt, endian)
-        flags = _u(data, base + (64 if wide else 56), "I", endian)
-        reserved2 = _u(data, base + (72 if wide else 60), "I", endian)
-        if sectname == "__stubs" and (flags & 0xFF) == S_SYMBOL_STUBS and reserved2 > 0:
-            scan.stub_sections.append((addr, size, reserved2))
+        stub = _macho_stub_section(data, endian, base, wide)
+        if stub is not None:
+            scan.stub_sections.append(stub)
 
 
 def _macho_segment(data: bytes, endian: str, at: int, command: int, scan: _MachoScan) -> None:
@@ -880,6 +908,36 @@ def _macho_scan_commands(data: bytes, bits: int, endian: str, at: int, commands:
     return scan
 
 
+def _macho_entry(scan: _MachoScan) -> Optional[int]:
+    if scan.text_vmaddr is not None and scan.entry_offset is not None:
+        return scan.text_vmaddr + scan.entry_offset
+    return scan.entry_offset
+
+
+def _macho_stack_canary(scan: _MachoScan, data: bytes) -> Optional[bool]:
+    if any(name in {"__stack_chk_fail", "__stack_chk_guard"} for name in scan.symbols):
+        return True
+    if scan.has_symtab:
+        return False
+    if b"___stack_chk_fail" in data:
+        return True
+    # Stripped binary without the canary symbol: presence is unknown, not absent.
+    return None
+
+
+def _macho_plt_addresses(scan: _MachoScan) -> Dict[str, str]:
+    # Heuristic stub map: the i-th __stubs entry binds the i-th undefined symbol
+    # (dyld orders them correspondingly); used to resolve Ghidra auto-labels.
+    plt_addresses: Dict[str, str] = {}
+    for stub_va, stub_total, stub_size in scan.stub_sections:
+        for index, name in enumerate(scan.undefined_ordered):
+            stub_addr = stub_va + index * stub_size
+            if stub_total and stub_addr >= stub_va + stub_total:
+                break
+            plt_addresses["0x%x" % stub_addr] = name
+    return plt_addresses
+
+
 def parse_macho(data: bytes) -> BinaryInfo:
     magic = data[:4]
     endian = ">" if magic in {b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf"} else "<"
@@ -892,35 +950,16 @@ def parse_macho(data: bytes) -> BinaryInfo:
     commands = _u(data, 16, "I", endian)
     flags = _u(data, 24, "I", endian)
     scan = _macho_scan_commands(data, bits, endian, header_size, commands)
-    if scan.text_vmaddr is not None and scan.entry_offset is not None:
-        entry: Optional[int] = scan.text_vmaddr + scan.entry_offset
-    else:
-        entry = scan.entry_offset
+    entry = _macho_entry(scan)
     values = extract_strings(data)
     parsed_imports, string_hints, imports = _split_imports(sorted(scan.undefined_symbols), values)
     pie = bool(flags & 0x200000)
-    if any(name in {"__stack_chk_fail", "__stack_chk_guard"} for name in scan.symbols):
-        stack_canary: Optional[bool] = True
-    elif scan.has_symtab:
-        stack_canary = False
-    elif b"___stack_chk_fail" in data:
-        stack_canary = True
-    else:
-        # Stripped binary without the canary symbol: presence is unknown, not absent.
-        stack_canary = None
+    stack_canary = _macho_stack_canary(scan, data)
     rwx_sections = set(scan.rwx_sections)
     if scan.executable_stack:
         rwx_sections.add("__UNIXSTACK")
     symbol_addresses = scan.symbol_addresses
-    # Heuristic stub map: the i-th __stubs entry binds the i-th undefined symbol
-    # (dyld orders them correspondingly); used to resolve Ghidra auto-labels.
-    plt_addresses: Dict[str, str] = {}
-    for stub_va, stub_total, stub_size in scan.stub_sections:
-        for index, name in enumerate(scan.undefined_ordered):
-            stub_addr = stub_va + index * stub_size
-            if stub_total and stub_addr >= stub_va + stub_total:
-                break
-            plt_addresses["0x%x" % stub_addr] = name
+    plt_addresses = _macho_plt_addresses(scan)
     return BinaryInfo(
         format="Mach-O", bits=bits, endian="big" if endian == ">" else "little",
         architecture=MACH_CPU.get(cpu, "cpu-%d" % cpu), entrypoint=entry,

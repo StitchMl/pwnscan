@@ -19,6 +19,10 @@ class BinaryInfo:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+GUARDED_PREFIX = "[guarded] "
+NO_FLAG_PATH = "Manual confirmation required before a flag-recovery payload exists."
+
+
 @dataclass(frozen=True)
 class Finding:
     id: str
@@ -30,7 +34,7 @@ class Finding:
     validation: List[str]
     patch: str
     exploit_status: str = "validation-only"
-    flag_path: str = "Manual confirmation required before a flag-recovery payload exists."
+    flag_path: str = NO_FLAG_PATH
 
 
 @dataclass(frozen=True)
