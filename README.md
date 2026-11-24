@@ -125,3 +125,112 @@ binaries.
 Use this tool for CTF challenges, labs, and systems you may test. `pwnscan`
 does not connect to targets or execute target code. Generated scaffolds contain
 only addresses derived from the supplied artifact and require manual validation.
+
+## Batch analysis of arbitrary CTF binaries
+
+Install Ghidra separately and set `GHIDRA_HOME` to its extracted installation
+root (containing `support/analyzeHeadless`). The batch entry point accepts
+individual files and directories. It detects ELF, PE, and thin Mach-O candidates
+by magic bytes, not file extension or challenge name. Binaries are **never
+executed**.
+
+```console
+pwnscan-batch ./challenges --recursive --ghidra-auto --output-dir ./reports
+pwnscan-batch ./challenge1 ./challenge2 --ghidra-auto --keep-ghidra-export
+```
+
+Reports are saved as separate JSON files with SHA-256-derived suffixes to avoid
+basename collisions, plus an `index.json` listing successes and failures.
+An unsupported or failed target does not abort the remaining batch; the command
+returns exit code 2 if any target failed. Default execution without
+`--ghidra-auto` performs fast static triage. Use `--ghidra-timeout 600` for
+large binaries, and `--ghidra-home /path/to/ghidra` to select a specific Ghidra
+install. Ghidra headless analysis is CPU/memory intensive and processes files
+sequentially to keep resource usage bounded.
+
+When installed from a source checkout with `pip install -e .`, the bundled
+Java exporter is discovered automatically. The batch command also supports
+`--ghidra-script /path/to/PwnscanExport.java` when using a custom exporter.
+
+## Experimental exploit solver (explicit opt-in)
+
+The static scanner does not recover runtime secrets or flags. The `pwnscan-solve`
+command is an experimental strategy selector for (a) Ghidra-evidenced dynamic
+format-string calls with uppercase secrets of known or inferred length, and
+(b) statically proven direct ret2win payloads with known offsets, fixed code
+addresses, and disabled PIE/ASLR and stack canaries. Unsupported binaries
+return a diagnostic instead of a fabricated flag. It is not a universal solver.
+
+On Windows, Ghidra runs automatically first and a standalone Linux script is
+generated. With `--execute --wsl`, the script runs inside WSL:
+
+```powershell
+pwnscan-solve "C:\Users\Matteo\Downloads\babyfmt_level1.0" `
+  --ghidra-home "C:\Tools\ghidra_12.0_PUBLIC" `
+  --execute --wsl `
+  --output "$HOME\Desktop\babyfmt_level1.solve.py"
+```
+
+On Linux use: `pwnscan-solve ./challenge --execute`. Choose a strategy with
+`--strategy format-token` or `--strategy ret2win`; the default `auto`
+prefers a complete ret2win chain. On Windows, `--execute --wsl` requires
+an installed Linux distribution and Python 3 inside WSL. Generated code is
+saved without running it unless `--execute` is explicitly specified.
+
+The generated solver probes positional `%N$s` reads in separate processes and
+submits any candidate in the same process (secrets can change across launches).
+It prints a candidate only when success text is observed. A local password may
+unlock a subsequent `/flag` read, but is not necessarily itself the CTF flag.
+Executing an untrusted challenge is opt-in and should be done only in an isolated
+authorized environment. The normal static scanner never executes the target.
+
+A direct ret2win runner submits the exact payload recovered from the existing
+`PWN-FLAG-CHAIN-001` finding. It reports `flag-pattern-observed` only when
+recognizable flag-shaped text appears in stdout; a successful function return
+without observable output is not proof that the flag was recovered. The
+format-token runner reports password acceptance, not a recovered flag.
+
+## TCP challenge protocol harness
+
+`pwnscan-tcp` validates and replays bounded TCP protocol transcripts in an
+authorized environment. This is **not** a generic heap solver: protocol steps
+must be supplied as JSON, and receiving a flag-like string is only evidence
+that the remote process printed that string.
+
+Example `steps.json`:
+
+```json
+[
+  {"recv_until": "Choice:"},
+  {"send": "1\n"},
+  {"recv_until": "Index:"},
+  {"send": "0\n"}
+]
+```
+
+Dry validation (does not connect):
+
+```powershell
+pwnscan-tcp "$HOME\Desktop\steps.json"
+```
+
+Replay against a **local challenge you started yourself**:
+
+```powershell
+pwnscan-tcp "$HOME\Desktop\steps.json" --host 127.0.0.1 --port 1337 --execute
+```
+
+Supported actions are `send`, `send_hex`, and `recv_until`. Each
+operation is bounded, and connection requires an explicit `--execute`.
+This harness does not derive heap allocator states, discover menus or bypass
+PIE/ASLR automatically.
+
+## Heap lifetime evidence quality
+
+The earlier `PWN-HEAP-001` heuristic falsely matched different `free`
+calls when their Ghidra arguments reused a temporary P-code `unique`
+varnode (for example, `(unique, 0x23e00, 8)`). Such varnode reuse is
+**not** pointer identity, so the analyzer now requires a named high variable
+or explicit stack offset for a candidate. Findings remain low-confidence
+validation-only, because the scanner still lacks complete CFG feasibility,
+pointer alias/reassignment tracking and allocator-state reasoning.
