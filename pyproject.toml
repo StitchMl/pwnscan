@@ -13,7 +13,7 @@ authors = [{name = "pwnscan contributors"}]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "complexipy"]
 
 [project.scripts]
 pwnscan = "pwnscan.cli:main"
