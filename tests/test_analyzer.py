@@ -1290,3 +1290,138 @@ def test_findings_sorted_by_severity_then_confidence():
     findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
     low_ids = [item.id for item in findings if item.severity == "low"]
     assert low_ids.index("PWN-CFLOW-002") < low_ids.index("PWN-CFLOW-003")
+
+
+def test_heap_chunk_overflow_detected_for_malloc_and_calloc():
+    info = BinaryInfo(
+        "ELF", 64, "little", "x86_64", 0x401000,
+        mitigations={"nx": True, "pie": False, "stack_canary": True, "relro": "full"},
+        metadata={
+            "ghidra": {
+                "calls": [
+                    {
+                        "from": "00401110",
+                        "function": "main",
+                        "order": 1,
+                        "to": "malloc",
+                        "return_var": {"high_name": "buf", "repr": "RAX"},
+                        "arguments": [{"kind": "constant", "value": 32}],
+                    },
+                    {
+                        "from": "00401124",
+                        "function": "main",
+                        "order": 2,
+                        "to": "read",
+                        "arguments": [
+                            {"kind": "constant", "value": 0},
+                            {"kind": "dynamic", "high_name": "buf", "repr": "RAX"},
+                            {"kind": "constant", "value": 64},
+                        ],
+                    },
+                    {
+                        "from": "00401140",
+                        "function": "other",
+                        "order": 1,
+                        "to": "calloc",
+                        "return_var": {"high_name": "arr", "repr": "RAX"},
+                        "arguments": [{"kind": "constant", "value": 4}, {"kind": "constant", "value": 8}],
+                    },
+                    {
+                        "from": "00401154",
+                        "function": "other",
+                        "order": 2,
+                        "to": "memcpy",
+                        "arguments": [
+                            {"kind": "dynamic", "high_name": "arr", "repr": "RAX"},
+                            {"kind": "dynamic", "repr": "RSI"},
+                            {"kind": "constant", "value": 40},
+                        ],
+                    },
+                ],
+            },
+        },
+    )
+    findings = {item.id: item for item in analyze(info)}
+    assert "PWN-HEAP-003" in findings
+    heap_ovf = findings["PWN-HEAP-003"]
+    assert heap_ovf.severity == "high"
+    assert heap_ovf.confidence == "high"
+    assert any("64 bytes into a 32-byte heap chunk" in ev for ev in heap_ovf.evidence)
+    assert any("40 bytes into a 32-byte heap chunk" in ev for ev in heap_ovf.evidence)
+
+
+def test_heap_chunk_overflow_ignores_safe_and_reassigned_writes():
+    info = BinaryInfo(
+        "ELF", 64, "little", "x86_64", 0x401000,
+        mitigations={"nx": True, "pie": False, "stack_canary": True, "relro": "full"},
+        metadata={
+            "ghidra": {
+                "calls": [
+                    {
+                        "from": "00401110",
+                        "function": "main",
+                        "order": 1,
+                        "to": "malloc",
+                        "return_var": {"high_name": "buf", "repr": "RAX"},
+                        "arguments": [{"kind": "constant", "value": 32}],
+                    },
+                    {
+                        "from": "00401120",
+                        "function": "main",
+                        "order": 2,
+                        "to": "realloc",
+                        "return_var": {"high_name": "buf", "repr": "RAX"},
+                        "arguments": [
+                            {"kind": "dynamic", "high_name": "buf", "repr": "RAX"},
+                            {"kind": "constant", "value": 128},
+                        ],
+                    },
+                    {
+                        "from": "00401134",
+                        "function": "main",
+                        "order": 3,
+                        "to": "read",
+                        "arguments": [
+                            {"kind": "constant", "value": 0},
+                            {"kind": "dynamic", "high_name": "buf", "repr": "RAX"},
+                            {"kind": "constant", "value": 64},
+                        ],
+                    },
+                ],
+            },
+        },
+    )
+    findings = {item.id: item for item in analyze(info)}
+    assert "PWN-HEAP-003" not in findings
+
+
+def test_exact_ret2win_includes_aligned_x86_64_payload_when_ret_gadget_present():
+    info = BinaryInfo(
+        "ELF", 64, "little", "x86_64", 0x401000,
+        symbols=["win"],
+        mitigations={"nx": True, "pie": False, "stack_canary": False, "relro": "partial"},
+        metadata={
+            "symbol_addresses": {"win": 0x401234},
+            "gadgets": {"ret": [0x401016]},
+            "ghidra": {
+                "calls": [
+                    {
+                        "from": "00401150",
+                        "function": "vuln",
+                        "to": "read",
+                        "arguments": [
+                            {"kind": "constant", "value": 0},
+                            {"kind": "stack", "return_address_offset": 40, "buffer_size": 32},
+                            {"kind": "constant", "value": 100},
+                        ],
+                    },
+                ],
+            },
+        },
+    )
+    findings = {item.id: item for item in analyze(info)}
+    chain = findings["PWN-FLAG-CHAIN-001"]
+    assert chain.exploit_status == "payload-ready"
+    assert "aligned_payload_hex=" in chain.attack_vector
+    assert "0x401016" in chain.attack_vector
+    assert any("16-byte stack alignment" in ev for ev in chain.evidence)

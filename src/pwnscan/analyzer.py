@@ -473,24 +473,32 @@ def _write_capacity(destination: dict) -> Optional[tuple[int, str]]:
     return None
 
 
+def _write_request(call: dict, name: str) -> Optional[tuple[int, int]]:
+    if name == "fread":
+        requested = _fread_requested(call)
+        return (0, requested) if requested is not None else None
+    if name not in BOUNDED_WRITES:
+        return None
+    destination_index, length_index = BOUNDED_WRITES[name]
+    length = _call_argument(call, length_index)
+    requested = length.get("value") if length.get("kind") == "constant" else None
+    return (destination_index, requested) if isinstance(requested, int) else None
+
+
 def _bounded_overflows(calls: Sequence[dict]) -> list[dict]:
     result = []
     for call in calls:
         name = _call_name(call)
-        if name == "fread":
-            destination_index, requested = 0, _fread_requested(call)
-        elif name in BOUNDED_WRITES:
-            destination_index, length_index = BOUNDED_WRITES[name]
-            length = _call_argument(call, length_index)
-            requested = length.get("value") if length.get("kind") == "constant" else None
-        else:
+        request = _write_request(call, name)
+        if request is None:
             continue
+        destination_index, requested = request
         destination = _call_argument(call, destination_index)
         capacity = _write_capacity(destination)
         if capacity is None:
             continue
         capacity_value, capacity_kind = capacity
-        if isinstance(requested, int) and requested > capacity_value:
+        if requested > capacity_value:
             result.append({
                 "call": call, "name": name, "buffer_size": capacity_value,
                 "capacity_kind": capacity_kind, "requested": requested, "destination": destination,
@@ -542,15 +550,24 @@ def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Seque
         payload = (b"A" * return_offset) + chosen_address.to_bytes(pointer_size, info.endian)
         call = item["call"]
         payload_hex = payload.hex()
+        evidence = [
+            "Ghidra recovered saved return address offset %d for %s at %s" % (return_offset, item["name"], call.get("from")),
+            "fixed %s address: 0x%x" % (chosen_name, chosen_address),
+            "stack canary disabled; %s disabled" % address_key,
+        ]
+        vector = "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s." % (
+            payload_hex, payload_hex, item["name"], call.get("from"),
+        )
+        ret_gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
+        if ret_gadgets:
+            ret_addr = ret_gadgets[0]
+            aligned = (b"A" * return_offset) + ret_addr.to_bytes(pointer_size, info.endian) + chosen_address.to_bytes(pointer_size, info.endian)
+            evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
+            vector += " If x86_64 movaps alignment fails, use aligned_payload_hex=%s (prepends ret gadget 0x%x)." % (aligned.hex(), ret_addr)
         return _finding(
             "PWN-FLAG-CHAIN-001", "Verified direct flag-path overwrite", "critical", "high",
-            [
-                "Ghidra recovered saved return address offset %d for %s at %s" % (return_offset, item["name"], call.get("from")),
-                "fixed %s address: 0x%x" % (chosen_name, chosen_address),
-                "stack canary disabled; %s disabled" % address_key,
-            ],
-            "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s."
-            % (payload_hex, payload_hex, item["name"], call.get("from")),
+            evidence,
+            vector,
             [
                 "Run only against the authorized challenge instance.",
                 "Confirm execution reaches %s and capture its flag output." % chosen_name,
@@ -851,6 +868,80 @@ def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None
         "snprintf/vsnprintf returns the untruncated byte count that would have been written, not the actual bytes written. When truncated, feeding this return value into subsequent length/size calculations can underflow remaining capacity or cause an out-of-bounds read/write.",
         ["Check whether the snprintf call can be truncated by user input.", "Inspect the subsequent length or pointer arithmetic for wrap/underflow."],
         "Clamp the return value of snprintf to the buffer size (or check `ret < 0 || (size_t)ret >= size`) before using it as an offset or length.",
+    )
+
+
+def _allocated_chunk_size(call: dict, name: str) -> Optional[int]:
+    if name == "malloc":
+        arg = _call_argument(call, 0)
+        val = arg.get("value") if arg.get("kind") == "constant" else None
+        return val if isinstance(val, int) and val > 0 else None
+    if name == "realloc":
+        arg = _call_argument(call, 1)
+        val = arg.get("value") if arg.get("kind") == "constant" else None
+        return val if isinstance(val, int) and val > 0 else None
+    if name == "calloc":
+        a0, a1 = _call_argument(call, 0), _call_argument(call, 1)
+        if a0.get("kind") == "constant" and a1.get("kind") == "constant":
+            v0, v1 = a0.get("value"), a1.get("value")
+            if isinstance(v0, int) and isinstance(v1, int) and v0 > 0 and v1 > 0:
+                return v0 * v1
+    return None
+
+
+def _update_chunk_sizes(call: dict, function: str, name: str, chunk_sizes: dict) -> None:
+    size = _allocated_chunk_size(call, name)
+    for identity in _return_var_identities(call):
+        if size is not None:
+            chunk_sizes[(function, identity)] = size
+        else:
+            chunk_sizes.pop((function, identity), None)
+
+
+def _heap_chunk_overflows(calls: Sequence[dict]) -> list[dict]:
+    chunk_sizes: dict[tuple[str, str], int] = {}
+    overflows: list[dict] = []
+    for call in sorted(calls, key=lambda item: (str(item.get("function") or ""), _call_sort_key(item), str(item.get("from") or ""))):
+        function = call.get("function") or UNKNOWN
+        name = _call_name(call)
+        if name in {"malloc", "calloc", "realloc"}:
+            _update_chunk_sizes(call, function, name, chunk_sizes)
+            continue
+        if name in DEALLOCATORS:
+            freed_id = _argument_identity(_call_argument(call, 0))
+            if freed_id:
+                chunk_sizes.pop((function, freed_id), None)
+            continue
+        request = _write_request(call, name)
+        if request is None:
+            continue
+        dest_idx, requested = request
+        dest_id = _argument_identity(_call_argument(call, dest_idx))
+        capacity = chunk_sizes.get((function, dest_id)) if dest_id else None
+        if capacity is not None and requested > capacity:
+            overflows.append({"call": call, "name": name, "capacity": capacity, "requested": requested})
+    return overflows
+
+
+def _check_heap_overflows(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+    overflows = _heap_chunk_overflows(ghidra_calls)
+    if not overflows:
+        return None
+    evidence = [
+        "Ghidra call %s at %s in %s writes up to %d bytes into a %d-byte heap chunk; overflow window %d bytes"
+        % (item["name"], item["call"].get("from"), item["call"].get("function") or UNKNOWN, item["requested"], item["capacity"], item["requested"] - item["capacity"])
+        for item in overflows
+    ]
+    validation = [
+        "Send %d bytes to %s at %s and inspect adjacent heap chunk metadata or pointers in a debugger."
+        % (item["requested"], item["name"], item["call"].get("from"))
+        for item in overflows
+    ]
+    return _finding(
+        "PWN-HEAP-003", "Proven constant-length heap overwrite", "high", "high", evidence,
+        "A constant-length write exceeds the constant allocation size of the target heap chunk, corrupting adjacent chunk headers or user data.",
+        validation,
+        "Bound every heap write to the allocated chunk size and validate allocation lengths before copying.",
     )
 
 
@@ -1355,6 +1446,7 @@ def analyze(info: BinaryInfo) -> List[Finding]:
 
     candidates: List[Optional[Finding]] = [
         _check_bounded_overflows(bounded),
+        _check_heap_overflows(ghidra_calls),
         _check_boundary_writes(boundary),
         _check_integer_allocations(ghidra_calls, ghidra_cfg),
         _check_division(ghidra_calls),
