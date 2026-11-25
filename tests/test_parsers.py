@@ -543,3 +543,18 @@ def test_elf_function_symbols_excludes_data_objects():
     assert "win" in symbols
     assert addresses["secret"] == 0x404010
     assert func_syms == ["win"]
+
+
+def test_expanded_x86_and_x86_64_gadget_patterns():
+    from pwnscan.parsers import _gadget_patterns
+
+    p64 = _gadget_patterns(64, "x86_64")
+    assert p64["pop_rax_ret"] == b"\x58\xc3"
+    assert p64["pop_rcx_ret"] == b"\x59\xc3"
+    assert p64["pop_rbx_ret"] == b"\x5b\xc3"
+    assert p64["pop_rbp_ret"] == b"\x5d\xc3"
+
+    p32 = _gadget_patterns(32, "x86")
+    assert p32["int_0x80"] == b"\xcd\x80"
+    assert p32["pop_eax_ret"] == b"\x58\xc3"
+    assert p32["pop_ebx_ret"] == b"\x5b\xc3"

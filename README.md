@@ -34,9 +34,10 @@ pwnscan ./challenge --color always
 pwnscan ./challenge --format json --pretty
 pwnscan ./challenge --min-severity medium --output report.txt
 pwnscan ./challenge --fail-on high
+pwnscan ./challenges/ --min-severity medium
 ```
 
-`--min-severity` filters the reported findings to the selected severity or higher
+Passing a directory runs batch triage across all supported binaries inside it, automatically pairing any adjacent `<file>.ghidra.json` export and printing a compact summary table (or a JSON array with `--format json`). `--min-severity` filters the reported findings to the selected severity or higher
 (and `--fail-on` evaluates the filtered findings). `--output` (`-o`) writes the
 report to a file without ANSI color sequences in `auto` mode. `--fail-on`
 returns exit code `3` when the report contains the selected severity or a higher
@@ -91,7 +92,8 @@ pwnscan ./challenge --ghidra-auto --ghidra-home C:\Tools\ghidra_12.0_PUBLIC
 
 Set `GHIDRA_HOME` instead of passing `--ghidra-home`. `--ghidra-timeout`
 limits analysis time. Add `--ghidra-keep EXPORT.json` to also save the
-generated export next to the report instead of discarding it. Ghidra reads
+generated export next to the report instead of discarding it, or `--ghidra-cache`
+to reuse `<target>.ghidra.json` when its `sha256` still matches the binary. Ghidra reads
 and decompiles the target; it never runs it.
 Recovered P-code arguments let `pwnscan` prove constant-size stack overwrites,
 compute saved-return offsets, reject constant `printf("%s", value)` calls, and

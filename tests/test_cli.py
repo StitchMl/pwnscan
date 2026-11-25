@@ -146,3 +146,33 @@ def test_cli_ghidra_cache_requires_auto_and_reuses_up_to_date_export(tmp_path, c
     target.write_bytes(minimal_elf64(b"gets\0"))
     assert main([str(target), "--ghidra-auto", "--ghidra-cache"]) == 0
     assert len(calls) == 2
+
+
+def test_cli_batch_directory_scan_text_and_json(tmp_path, capsys):
+    chal1 = tmp_path / "chal1"
+    chal1.write_bytes(minimal_elf64(b"gets\0"))
+    chal2 = tmp_path / "chal2"
+    chal2.write_bytes(minimal_elf64(b"puts\0"))
+    (tmp_path / "notes.txt").write_text("not a binary", encoding="utf-8")
+    (tmp_path / "chal2.ghidra.json").write_text(
+        '{"schema":"pwnscan-ghidra/v1","functions":[{"name":"win","entry":"00401100"}],"imports":[],"calls":[]}',
+        encoding="utf-8",
+    )
+
+    assert main([str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "TARGET" in out
+    assert "chal1" in out
+    assert "chal2" in out
+    assert "PWN-BOF-001" in out
+    assert "PWN-WIN-001" in out
+
+    assert main([str(tmp_path), "--format", "json", "--fail-on", "medium"]) == 3
+    json_out = capsys.readouterr().out
+    assert '"target":' in json_out
+    assert json_out.strip().startswith("[")
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert main([str(empty_dir)]) == 2
+    assert "no supported binaries found" in capsys.readouterr().err
