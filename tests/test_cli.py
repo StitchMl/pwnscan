@@ -176,3 +176,17 @@ def test_cli_batch_directory_scan_text_and_json(tmp_path, capsys):
     empty_dir.mkdir()
     assert main([str(empty_dir)]) == 2
     assert "no supported binaries found" in capsys.readouterr().err
+
+
+def test_cli_markdown_single_and_batch(tmp_path, capsys):
+    chal1 = tmp_path / "chal1"
+    chal1.write_bytes(minimal_elf64(b"gets\0"))
+    assert main([str(chal1), "--format", "markdown"]) == 0
+    single_out = capsys.readouterr().out
+    assert "# pwnscan Report: `chal1`" in single_out
+    assert "`PWN-BOF-001`" in single_out
+
+    assert main([str(tmp_path), "--format", "markdown"]) == 0
+    batch_out = capsys.readouterr().out
+    assert "# pwnscan Batch Report" in batch_out
+    assert "| `chal1` | `ELF/64/x86_64` |" in batch_out

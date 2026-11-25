@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from pwnscan.model import BinaryInfo, Finding, ScanReport
-from pwnscan.report import render_json, render_text, use_color
+from pwnscan.report import render_batch_markdown, render_json, render_markdown, render_text, use_color
 
 
 def _sample_report() -> ScanReport:
@@ -124,3 +124,25 @@ def test_render_text_wraps_long_fields_and_imports_aligned():
     assert lines[imports_idx + 1].startswith(" " * len("imports: "))
     vector_idx = next(i for i, line in enumerate(lines) if line.startswith("  vector:"))
     assert lines[vector_idx + 1].startswith(" " * 14)
+
+
+def test_render_markdown_single_and_empty():
+    md = render_markdown(_sample_report())
+    assert "# pwnscan Report: `sample.exe`" in md
+    assert "| `aslr` | on |" in md
+    assert "| `cfg` | unknown |" in md
+    assert "| `nx` | off |" in md
+    assert "_none found_" in md
+    assert "### [MEDIUM] `PWN-MIT-001` Exploit mitigations disabled" in md
+    assert "- **Evidence:**\n  - nx disabled" in md
+
+    empty = ScanReport("pwnscan/v1", "empty.exe", "0" * 64, 1, _sample_report().binary, [])
+    assert "No findings." in render_markdown(empty)
+
+
+def test_render_batch_markdown():
+    md = render_batch_markdown([_sample_report()])
+    assert "# pwnscan Batch Report" in md
+    assert "| `sample.exe` | `PE/64/x86_64` | medium | `PWN-MIT-001` |" in md
+    assert "## `sample.exe`" in md
+    assert "### [MEDIUM] `PWN-MIT-001` Exploit mitigations disabled" in md

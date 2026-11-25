@@ -17,7 +17,7 @@ from .ghidra import (
     is_cache_valid,
     write_cached_export,
 )
-from .report import render_json, render_text, use_color
+from .report import render_batch_markdown, render_json, render_markdown, render_text, use_color
 
 
 def parser() -> argparse.ArgumentParser:
@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     result.add_argument("target", type=Path, help="ELF, PE, or Mach-O file, or a directory for batch triage (auto-pairs <file>.ghidra.json)")
-    result.add_argument("--format", choices=("text", "json"), default="text", dest="output_format")
+    result.add_argument("--format", choices=("text", "json", "markdown"), default="text", dest="output_format")
     result.add_argument("--pretty", action="store_true", help="indent JSON output")
     result.add_argument("--color", choices=("auto", "always", "never"), default="auto")
     result.add_argument("--output", "-o", type=Path, metavar="FILE", help="write report to a file instead of stdout")
@@ -77,6 +77,8 @@ def _check_args(args: argparse.Namespace) -> None:
 def _render(args: argparse.Namespace, report) -> str:
     if args.output_format == "json":
         return render_json(report, args.pretty) + "\n"
+    if args.output_format == "markdown":
+        return render_markdown(report)
     color_mode = "never" if (args.output is not None and args.color == "auto") else args.color
     return render_text(report, use_color(color_mode))
 
@@ -110,7 +112,7 @@ def _resolve_ghidra_export(target: Path, args: argparse.Namespace) -> tuple[Opti
 
 
 def _batch_targets(directory: Path) -> list[Path]:
-    ignored_suffixes = (".ghidra.json", ".report.json", ".report.txt")
+    ignored_suffixes = (".ghidra.json", ".report.json", ".report.txt", ".report.md")
     return sorted(
         path for path in directory.iterdir()
         if path.is_file() and not any(path.name.endswith(suffix) for suffix in ignored_suffixes)
@@ -136,6 +138,8 @@ def _render_batch(args: argparse.Namespace, reports: list) -> str:
             separators=None if args.pretty else (",", ":"),
             ensure_ascii=True,
         ) + "\n"
+    if args.output_format == "markdown":
+        return render_batch_markdown(reports)
     lines = ["%-30s %-18s %-10s %s" % ("TARGET", "ARCH", "TOP", "FINDINGS")]
     for report in reports:
         arch = "%s/%s/%s" % (report.binary.format, report.binary.bits, report.binary.architecture)

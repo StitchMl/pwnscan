@@ -28,6 +28,85 @@ def render_json(report: ScanReport, pretty: bool = False) -> str:
     return json.dumps(report.as_dict(), indent=2 if pretty else None, sort_keys=True, separators=None if pretty else (",", ":"), ensure_ascii=True)
 
 
+def render_markdown(report: ScanReport) -> str:
+    """Render a single ScanReport as a human-readable Markdown document."""
+    binary = report.binary
+    entrypoint = "unknown" if binary.entrypoint is None else hex(binary.entrypoint)
+    lines = [
+        f"# pwnscan Report: `{os.path.basename(report.target) or report.target}`",
+        "",
+        f"- **Target:** `{report.target}`",
+        f"- **Format:** `{binary.format} {binary.bits}-bit {binary.architecture} ({binary.endian})`",
+        f"- **Entrypoint:** `{entrypoint}`",
+        f"- **Size:** {report.size} bytes",
+        f"- **SHA-256:** `{report.sha256}`",
+        f"- **Findings:** {_summary(report.findings)}",
+        "",
+        "## Mitigations",
+        "",
+    ]
+    if binary.mitigations:
+        lines.extend(["| Mitigation | Status |", "| --- | --- |"])
+        for key, value in sorted(binary.mitigations.items()):
+            lines.append(f"| `{key}` | {_state(value)} |")
+    else:
+        lines.append("None reported.")
+    lines.extend(["", "## Imports", ""])
+    lines.append(", ".join(f"`{imp}`" for imp in binary.imports) if binary.imports else "_none found_")
+    lines.extend(["", "## Findings", ""])
+    if not report.findings:
+        lines.append("No findings.")
+    else:
+        for finding in report.findings:
+            lines.extend(_render_finding_markdown(finding, heading="###"))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_batch_markdown(reports: list[ScanReport]) -> str:
+    """Render multiple ScanReports as a Markdown summary table and per-target details."""
+    lines = [
+        "# pwnscan Batch Report",
+        "",
+        "| Target | Arch | Top Severity | Findings |",
+        "| --- | --- | --- | --- |",
+    ]
+    for report in reports:
+        name = os.path.basename(report.target) or report.target
+        arch = f"{report.binary.format}/{report.binary.bits}/{report.binary.architecture}"
+        top = report.findings[0].severity if report.findings else "none"
+        ids = ", ".join(f"`{item.id}`" for item in report.findings) if report.findings else "none"
+        lines.append(f"| `{name}` | `{arch}` | {top} | {ids} |")
+    for report in reports:
+        name = os.path.basename(report.target) or report.target
+        lines.extend(["", f"## `{name}`", "", f"- **Target:** `{report.target}`", f"- **Findings:** {_summary(report.findings)}", ""])
+        if not report.findings:
+            lines.append("No findings.")
+        else:
+            for finding in report.findings:
+                lines.extend(_render_finding_markdown(finding, heading="###"))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_finding_markdown(finding, heading: str = "###") -> list[str]:
+    lines = [
+        f"{heading} [{finding.severity.upper()}] `{finding.id}` {finding.title}",
+        "",
+        f"- **Confidence:** `{finding.confidence}`",
+        f"- **Exploit Status:** `{finding.exploit_status}`",
+        f"- **Flag Path:** {finding.flag_path}",
+        f"- **Attack Vector:** {finding.attack_vector}",
+        f"- **Patch:** {finding.patch}",
+    ]
+    if finding.evidence:
+        lines.append("- **Evidence:**")
+        lines.extend(f"  - {item}" for item in finding.evidence)
+    if finding.validation:
+        lines.append("- **Validation:**")
+        lines.extend(f"  - {step}" for step in finding.validation)
+    lines.append("")
+    return lines
+
+
 def _wrap_width(width: int | None = None) -> int:
     if width is not None:
         return max(40, width)
