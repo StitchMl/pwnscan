@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -68,3 +70,39 @@ def export_headless(target: Path, home: Optional[Path] = None, script: Optional[
             tail = "\n".join(completed.stdout.splitlines()[-12:])
             raise GhidraError("Ghidra headless returned %d\n%s" % (completed.returncode, tail))
     return output
+
+
+def _target_sha256(target: Path) -> str:
+    return hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def default_cache_path(target: Path) -> Path:
+    return target.with_name(target.name + ".ghidra.json")
+
+
+def is_cache_valid(target: Path, cache_path: Path) -> bool:
+    if not cache_path.is_file():
+        return False
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or payload.get("schema") != "pwnscan-ghidra/v1":
+        return False
+    cached_hash = payload.get("target_sha256")
+    if isinstance(cached_hash, str):
+        return cached_hash == _target_sha256(target)
+    return cache_path.stat().st_mtime >= target.stat().st_mtime
+
+
+def write_cached_export(target: Path, export_path: Path, cache_path: Path) -> None:
+    try:
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        shutil.copyfile(export_path, cache_path)
+        return
+    if not isinstance(payload, dict):
+        shutil.copyfile(export_path, cache_path)
+        return
+    payload["target_sha256"] = _target_sha256(target)
+    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

@@ -117,3 +117,32 @@ def test_cli_ghidra_keep_saves_export_and_requires_auto(tmp_path, capsys, monkey
     assert kept.is_file()
     assert kept.read_text(encoding="utf-8").startswith('{"schema":"pwnscan-ghidra/v1"')
     assert not export.exists()
+
+
+def test_cli_ghidra_cache_requires_auto_and_reuses_up_to_date_export(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    assert main([str(target), "--ghidra-cache"]) == 2
+    assert "--ghidra-cache requires --ghidra-auto" in capsys.readouterr().err
+
+    calls = []
+
+    def fake_export(actual_target, home, script, timeout):
+        export = tmp_path / ("gen_%d.json" % len(calls))
+        export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[],"imports":[],"calls":[]}', encoding="utf-8")
+        calls.append(actual_target)
+        return export
+
+    monkeypatch.setattr("pwnscan.cli.export_headless", fake_export)
+    assert main([str(target), "--ghidra-auto", "--ghidra-cache"]) == 0
+    assert len(calls) == 1
+    cache_file = tmp_path / "challenge.ghidra.json"
+    assert cache_file.is_file()
+
+    assert main([str(target), "--ghidra-auto", "--ghidra-cache"]) == 0
+    assert len(calls) == 1
+    assert "reusing cached Ghidra export" in capsys.readouterr().err
+
+    target.write_bytes(minimal_elf64(b"gets\0"))
+    assert main([str(target), "--ghidra-auto", "--ghidra-cache"]) == 0
+    assert len(calls) == 2

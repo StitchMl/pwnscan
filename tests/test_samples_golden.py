@@ -28,6 +28,9 @@ def test_sample_report_matches_golden(binary):
     report = scan_file(binary, binary.parent / (binary.name + ".ghidra.json"))
     with open(reference_path, encoding="utf-8") as handle:
         reference = json.load(handle)
-    current = {(item.id, item.severity) for item in report.findings}
-    expected = {(item["id"], item["severity"]) for item in reference["findings"]}
+    current = {(item.id, item.severity, item.confidence, item.exploit_status) for item in report.findings}
+    expected = {
+        (item["id"], item["severity"], item["confidence"], item["exploit_status"])
+        for item in reference["findings"]
+    }
     assert current == expected

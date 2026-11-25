@@ -99,3 +99,24 @@ def test_headless_timeout_raises_ghidra_error(tmp_path, monkeypatch):
     monkeypatch.setattr("pwnscan.ghidra.subprocess.run", fake_timeout)
     with pytest.raises(GhidraError, match="Ghidra headless failed"):
         export_headless(target, home, script, 5)
+
+
+def test_ghidra_cache_validation_and_write(tmp_path):
+    from pwnscan.ghidra import default_cache_path, is_cache_valid, write_cached_export
+
+    target = tmp_path / "chal"
+    target.write_bytes(b"\x7fELFdata")
+    cache_path = default_cache_path(target)
+    assert cache_path == tmp_path / "chal.ghidra.json"
+    assert not is_cache_valid(target, cache_path)
+
+    raw_export = tmp_path / "raw.json"
+    raw_export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[],"imports":[],"calls":[]}', encoding="utf-8")
+    write_cached_export(target, raw_export, cache_path)
+    assert is_cache_valid(target, cache_path)
+
+    target.write_bytes(b"\x7fELFmodified")
+    assert not is_cache_valid(target, cache_path)
+
+    cache_path.write_text("{bad-json", encoding="utf-8")
+    assert not is_cache_valid(target, cache_path)

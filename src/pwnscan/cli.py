@@ -8,7 +8,13 @@ from pathlib import Path
 
 from . import __version__
 from .analyzer import SEVERITY_ORDER, scan_file
-from .ghidra import GhidraError, export_headless
+from .ghidra import (
+    GhidraError,
+    default_cache_path,
+    export_headless,
+    is_cache_valid,
+    write_cached_export,
+)
 from .report import render_json, render_text, use_color
 
 
@@ -22,6 +28,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-severity", choices=("critical", "high", "medium", "low", "info"), help="only include findings at this severity or higher")
     result.add_argument("--ghidra", type=Path, metavar="EXPORT.json", help="merge deterministic metadata exported by PwnscanExport.java")
     result.add_argument("--ghidra-auto", action="store_true", help="run optional Ghidra headless analysis and merge its export")
+    result.add_argument("--ghidra-cache", action="store_true", help="with --ghidra-auto, reuse or save <target>.ghidra.json (or --ghidra-keep) when up-to-date")
     result.add_argument("--ghidra-keep", type=Path, metavar="EXPORT.json", help="with --ghidra-auto, also save the generated Ghidra export to this file")
     result.add_argument("--ghidra-home", type=Path, help="Ghidra installation directory for --ghidra-auto")
     result.add_argument("--ghidra-script", type=Path, help=argparse.SUPPRESS)
@@ -36,6 +43,8 @@ def _check_args(args: argparse.Namespace) -> None:
         raise ValueError("choose either --ghidra or --ghidra-auto")
     if args.ghidra_keep and not args.ghidra_auto:
         raise ValueError("--ghidra-keep requires --ghidra-auto")
+    if args.ghidra_cache and not args.ghidra_auto:
+        raise ValueError("--ghidra-cache requires --ghidra-auto")
     if args.ghidra_keep is not None:
         keep = args.ghidra_keep.resolve()
         if keep.is_dir() or not keep.parent.is_dir():
@@ -62,6 +71,22 @@ def _filtered(args: argparse.Namespace, report):
     return replace(report, findings=[item for item in report.findings if SEVERITY_ORDER[item.severity] <= threshold])
 
 
+def _resolve_ghidra_export(args: argparse.Namespace) -> tuple[Path | None, Path | None]:
+    if not args.ghidra_auto:
+        return args.ghidra, None
+    cache_path = args.ghidra_keep.resolve() if args.ghidra_keep is not None else default_cache_path(args.target)
+    if args.ghidra_cache and is_cache_valid(args.target, cache_path):
+        print("pwnscan: reusing cached Ghidra export %s" % cache_path, file=sys.stderr)
+        return cache_path, None
+    print("pwnscan: running Ghidra headless analysis (timeout: %ds)..." % args.ghidra_timeout, file=sys.stderr)
+    generated = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
+    if args.ghidra_cache:
+        write_cached_export(args.target, generated, cache_path)
+    elif args.ghidra_keep is not None:
+        shutil.copyfile(generated, cache_path)
+    return generated, generated
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
     if not args.target.is_file():
@@ -70,12 +95,8 @@ def main(argv=None) -> int:
     generated_export = None
     try:
         _check_args(args)
-        if args.ghidra_auto:
-            print("pwnscan: running Ghidra headless analysis (timeout: %ds)..." % args.ghidra_timeout, file=sys.stderr)
-            generated_export = export_headless(args.target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
-            if args.ghidra_keep is not None:
-                shutil.copyfile(generated_export, args.ghidra_keep.resolve())
-        report = _filtered(args, scan_file(args.target, generated_export or args.ghidra))
+        ghidra_export, generated_export = _resolve_ghidra_export(args)
+        report = _filtered(args, scan_file(args.target, ghidra_export))
         rendered = _render(args, report)
         if args.output is not None:
             args.output.resolve().write_text(rendered, encoding="utf-8")
