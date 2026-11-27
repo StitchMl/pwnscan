@@ -117,6 +117,31 @@ def test_exact_ret2win_payload_is_ready_only_with_complete_proof():
     assert "OFFSET" not in finding.attack_vector
 
 
+def test_ret_gadget_alignment_payload_must_fit_the_input_length():
+    for request_length, should_include_alignment in ((80, False), (88, True)):
+        findings = analyze(info(
+            imports=["read"], symbols=["print_flag"],
+            mitigations={"nx": True, "pie": False, "stack_canary": False},
+            metadata={
+                "symbol_addresses": {"print_flag": 0x401234},
+                "parsed_imports": ["read"],
+                "gadgets": {"ret": [0x401010]},
+                "ghidra": {"calls": [{
+                    "from": "00401110", "function": "main", "to": "read",
+                    "arguments": [
+                        {"kind": "constant", "value": 0},
+                        {"kind": "stack", "stack_offset": -80, "buffer_size": 64,
+                         "return_address_offset": 72, "variable": "name"},
+                        {"kind": "constant", "value": request_length},
+                    ],
+                }]},
+            },
+        ))
+        finding = next(item for item in findings if item.id == "PWN-FLAG-CHAIN-001")
+
+        assert ("aligned_payload_hex=" in finding.attack_vector) is should_include_alignment
+
+
 def test_exact_ret2win_payload_is_withheld_when_pie_is_enabled():
     findings = analyze(info(
         imports=["read"], symbols=["print_flag"],
