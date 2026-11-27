@@ -570,7 +570,7 @@ def _ret2win_finding(info: BinaryInfo, item: dict, name: str, address: int,
         payload_hex, payload_hex, item["name"], call.get("from"),
     )
     gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
-    if gadgets:
+    if gadgets and item["requested"] >= offset + 2 * pointer_size:
         ret_addr = gadgets[0]
         aligned = b"A" * offset + ret_addr.to_bytes(pointer_size, info.endian) + address.to_bytes(pointer_size, info.endian)
         evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
