@@ -89,13 +89,13 @@ def test_headless_executable_discovery_and_errors(tmp_path, monkeypatch):
 def test_headless_executable_discovers_common_user_install(tmp_path, monkeypatch):
     from pwnscan.ghidra import _headless_executable
 
-    install = tmp_path / "LocalAppData" / "Programs" / "ghidra_12.0_PUBLIC"
+    install = tmp_path / "tools" / "ghidra_12.0_PUBLIC"
     support = install / "support"
     support.mkdir(parents=True)
     executable = support / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
     executable.write_text("", encoding="utf-8")
 
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.setattr("pwnscan.ghidra.Path.home", lambda: tmp_path)
     monkeypatch.delenv("GHIDRA_HOME", raising=False)
     monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: None)
     assert _headless_executable() == executable

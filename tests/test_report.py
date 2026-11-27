@@ -1,7 +1,13 @@
 from types import SimpleNamespace
 
 from pwnscan.model import BinaryInfo, Finding, ScanReport
-from pwnscan.report import render_batch_markdown, render_json, render_markdown, render_text, use_color
+from pwnscan.report import (
+    render_batch_markdown,
+    render_json,
+    render_markdown,
+    render_text,
+    use_color,
+)
 
 
 def _sample_report() -> ScanReport:
