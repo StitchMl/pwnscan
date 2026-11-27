@@ -83,15 +83,19 @@ for PyGhidra installations. Run either exporter after analysis, then merge it:
 pwnscan ./challenge --ghidra ./challenge.ghidra.json
 ```
 
-If Ghidra is installed, the CLI can create an isolated temporary project,
-run headless analysis, merge the result, and remove the project:
+When Ghidra is installed, pwnscan locates it from `PATH`, `GHIDRA_HOME`, and
+common install directories, then runs headless analysis automatically for each
+binary. It creates an isolated temporary project, merges the export, and
+removes the project. Pass `--no-ghidra-auto` to skip this analysis:
 
 ```console
-pwnscan ./challenge --ghidra-auto --ghidra-home C:\Tools\ghidra_12.0_PUBLIC
+pwnscan ./challenge
+pwnscan ./challenge --no-ghidra-auto
 ```
 
-Set `GHIDRA_HOME` instead of passing `--ghidra-home`. `--ghidra-timeout`
-limits analysis time. Add `--ghidra-keep EXPORT.json` to also save the
+`--ghidra-auto` forces the analysis and reports an error if Ghidra is not
+installed. `--ghidra-home` remains available for a nonstandard install;
+`--ghidra-timeout` limits analysis time. Add `--ghidra-keep EXPORT.json` to save the
 generated export next to the report instead of discarding it, or `--ghidra-cache`
 to reuse `<target>.ghidra.json` when its `sha256` still matches the binary. Ghidra reads
 and decompiles the target; it never runs it.

