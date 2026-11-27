@@ -32,7 +32,15 @@ def _headless_temp_root() -> Path | None:
 
 
 def _platform_install_roots() -> list[Path]:
-    roots = [Path.home(), Path.home() / "tools", Path.home() / "Tools"]
+    user_home = Path.home()
+    roots = [
+        user_home,
+        user_home / "tools",
+        user_home / "Tools",
+        user_home / "Downloads",
+        user_home / "Desktop",
+        user_home / "Documents",
+    ]
     if os.name == "nt":
         for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA", "USERPROFILE"):
             value = os.environ.get(variable)

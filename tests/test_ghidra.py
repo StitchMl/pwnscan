@@ -101,6 +101,21 @@ def test_headless_executable_discovers_common_user_install(tmp_path, monkeypatch
     assert _headless_executable() == executable
 
 
+def test_headless_executable_discovers_downloaded_ghidra(tmp_path, monkeypatch):
+    from pwnscan.ghidra import _headless_executable
+
+    install = tmp_path / "Downloads" / "ghidra_12.0_PUBLIC"
+    support = install / "support"
+    support.mkdir(parents=True)
+    executable = support / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
+    executable.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr("pwnscan.ghidra.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("GHIDRA_HOME", raising=False)
+    monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: None)
+    assert _headless_executable() == executable
+
+
 def test_jdk_is_discovered_from_java_on_path(monkeypatch, tmp_path):
     jdk = tmp_path / "jdk-21"
     java = jdk / "bin" / ("java.exe" if os.name == "nt" else "java")
