@@ -15,8 +15,71 @@ class GhidraError(RuntimeError):
     pass
 
 
+def _headless_temp_root() -> Path | None:
+    candidates = [Path(tempfile.gettempdir())]
+    if os.name == "nt":
+        candidates.append(Path.home() / "AppData" / "Local" / "Temp")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if "#" not in str(candidate) and candidate.is_dir():
+            return candidate
+    raise GhidraError(
+        "No writable temporary directory without '#' is available for Ghidra projects"
+    )
+
+
+def _platform_install_roots() -> list[Path]:
+    roots = [Path.home(), Path.home() / "tools", Path.home() / "Tools"]
+    if os.name == "nt":
+        for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+            value = os.environ.get(variable)
+            if value:
+                root = Path(value)
+                roots.append(root)
+                roots.append(root / "Programs")
+        roots.extend((Path("C:/Tools"), Path("C:/ghidra")))
+    elif sys.platform == "darwin":
+        roots.extend((Path("/Applications"), Path("/opt/homebrew/opt"), Path("/opt")))
+    else:
+        roots.extend((Path("/opt"), Path("/usr/local"), Path("/usr/local/share")))
+    return roots
+
+
+def _directories(root: Path) -> list[Path]:
+    try:
+        return sorted((item for item in root.iterdir() if item.is_dir()),
+                      key=lambda item: item.name.casefold())
+    except OSError:
+        return []
+
+
+def _append_unique(path: Path, homes: list[Path], seen: set[Path]) -> None:
+    if path not in seen:
+        homes.append(path)
+        seen.add(path)
+
+
+def _common_ghidra_homes() -> list[Path]:
+    """Return bounded, common Ghidra install locations for each platform."""
+    homes: list[Path] = []
+    seen: set[Path] = set()
+    for root in _platform_install_roots():
+        _append_unique(root, homes, seen)
+        for child in _directories(root):
+            if "ghidra" not in child.name.casefold():
+                continue
+            _append_unique(child, homes, seen)
+            # Some installers use Program Files/Ghidra/<version>/support.
+            for version in _directories(child):
+                _append_unique(version, homes, seen)
+    return homes
+
+
 def _headless_executable(home: Optional[Path] = None) -> Path:
-    candidates = []
+    candidates: list[Path] = []
     if home is not None:
         candidates.append(home)
     configured = os.environ.get("GHIDRA_HOME")
@@ -25,12 +88,50 @@ def _headless_executable(home: Optional[Path] = None) -> Path:
     located = shutil.which("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
     if located:
         return Path(located)
+    candidates.extend(_common_ghidra_homes())
     name = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
     for candidate in candidates:
         executable = candidate / "support" / name
         if executable.is_file():
             return executable
-    raise GhidraError("Ghidra headless not found; use --ghidra-home or GHIDRA_HOME")
+    raise GhidraError("Ghidra headless was not found in PATH, GHIDRA_HOME, or common install locations")
+
+
+def find_headless_executable(home: Optional[Path] = None) -> Path | None:
+    """Detect Ghidra without turning an optional default into a hard failure."""
+    try:
+        return _headless_executable(home)
+    except GhidraError:
+        return None
+
+
+def _java_home() -> Path | None:
+    configured = os.environ.get("JAVA_HOME")
+    if configured:
+        candidate = Path(configured)
+        java_name = "java.exe" if os.name == "nt" else "java"
+        if (candidate / "bin" / java_name).is_file():
+            return candidate
+    java_name = "java.exe" if os.name == "nt" else "java"
+    located = shutil.which(java_name) or shutil.which("java")
+    if located is None:
+        return None
+    executable = Path(located).resolve()
+    if executable.parent.name.casefold() == "bin":
+        return executable.parent.parent
+    return None
+
+
+def _headless_environment(app_data: Path) -> dict[str, str]:
+    """Give Ghidra a discovered JDK and isolated writable per-run settings."""
+    environment = os.environ.copy()
+    java_home = _java_home()
+    if java_home is not None:
+        environment["JAVA_HOME"] = str(java_home)
+    if os.name == "nt":
+        app_data.mkdir(parents=True, exist_ok=True)
+        environment["APPDATA"] = str(app_data)
+    return environment
 
 
 def _export_script(explicit: Optional[Path] = None) -> Path:
@@ -51,23 +152,28 @@ def export_headless(target: Path, home: Optional[Path] = None, script: Optional[
     """Run Ghidra analysis in an isolated temporary project and return copied JSON."""
     executable = _headless_executable(home)
     export_script = _export_script(script)
-    output_fd, output_name = tempfile.mkstemp(prefix="pwnscan-ghidra-", suffix=".json")
+    output_fd, output_name = tempfile.mkstemp(
+        prefix="pwnscan-ghidra-", suffix=".json", dir=_headless_temp_root(),
+    )
     os.close(output_fd)
     output = Path(output_name)
-    with tempfile.TemporaryDirectory(prefix="pwnscan-ghidra-project-") as project:
+    with tempfile.TemporaryDirectory(
+        prefix="pwnscan-ghidra-project-", dir=_headless_temp_root(),
+    ) as project:
+        environment = _headless_environment(Path(project) / "appdata")
         command = [
             str(executable), project, "pwnscan", "-import", str(target.resolve()),
             "-scriptPath", str(export_script.parent), "-postScript", export_script.name,
             str(output), "-deleteProject",
         ]
         try:
-            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False)
+            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=environment)
         except (OSError, subprocess.TimeoutExpired) as exc:
             output.unlink(missing_ok=True)
             raise GhidraError("Ghidra headless failed: %s" % exc) from exc
         if completed.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
             output.unlink(missing_ok=True)
-            tail = "\n".join(completed.stdout.splitlines()[-12:])
+            tail = "\n".join(completed.stdout.splitlines()[-30:])
             raise GhidraError("Ghidra headless returned %d\n%s" % (completed.returncode, tail))
     return output
 

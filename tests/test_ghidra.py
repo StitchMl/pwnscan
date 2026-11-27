@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import pwnscan.ghidra as ghidra
 from pwnscan.ghidra import GhidraError, export_headless
 
 
@@ -60,8 +61,12 @@ def test_headless_executable_discovery_and_errors(tmp_path, monkeypatch):
     from pwnscan.ghidra import _export_script, _headless_executable
 
     monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: None)
+    monkeypatch.setattr("pwnscan.ghidra._common_ghidra_homes", list)
     monkeypatch.delenv("GHIDRA_HOME", raising=False)
-    with pytest.raises(GhidraError, match="Ghidra headless not found"):
+    monkeypatch.setattr("pwnscan.ghidra.Path.home", lambda: tmp_path / "empty-home")
+    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+        monkeypatch.delenv(variable, raising=False)
+    with pytest.raises(GhidraError, match="Ghidra headless was not found"):
         _headless_executable(None)
 
     home = tmp_path / "ghidra"
@@ -79,6 +84,52 @@ def test_headless_executable_discovery_and_errors(tmp_path, monkeypatch):
     monkeypatch.setattr("pwnscan.ghidra.Path.is_file", lambda _self: False)
     with pytest.raises(GhidraError, match=r"PwnscanExport\.java not found"):
         _export_script(tmp_path / "missing.java")
+
+
+def test_headless_executable_discovers_common_user_install(tmp_path, monkeypatch):
+    from pwnscan.ghidra import _headless_executable
+
+    install = tmp_path / "LocalAppData" / "Programs" / "ghidra_12.0_PUBLIC"
+    support = install / "support"
+    support.mkdir(parents=True)
+    executable = support / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
+    executable.write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.delenv("GHIDRA_HOME", raising=False)
+    monkeypatch.setattr("pwnscan.ghidra.shutil.which", lambda _: None)
+    assert _headless_executable() == executable
+
+
+def test_jdk_is_discovered_from_java_on_path(monkeypatch, tmp_path):
+    jdk = tmp_path / "jdk-21"
+    java = jdk / "bin" / ("java.exe" if os.name == "nt" else "java")
+    java.parent.mkdir(parents=True)
+    java.write_bytes(b"")
+    monkeypatch.setenv("JAVA_HOME", str(tmp_path / "missing-jdk"))
+    monkeypatch.setattr(ghidra.shutil, "which", lambda _name: str(java))
+
+    assert ghidra._java_home() == jdk
+
+
+def test_headless_environment_uses_temporary_appdata_on_windows(tmp_path):
+    environment = ghidra._headless_environment(tmp_path / "appdata")
+
+    if os.name == "nt":
+        assert environment["APPDATA"] == str(tmp_path / "appdata")
+        assert (tmp_path / "appdata").is_dir()
+
+
+def test_headless_temp_root_rejects_paths_ghidra_cannot_use(monkeypatch, tmp_path):
+    from pwnscan.ghidra import _headless_temp_root
+
+    sandbox_temp = tmp_path / "sandbox#temp"
+    sandbox_temp.mkdir()
+    monkeypatch.setattr(ghidra.tempfile, "gettempdir", lambda: str(sandbox_temp))
+    monkeypatch.setattr(ghidra.Path, "home", lambda: sandbox_temp)
+
+    with pytest.raises(GhidraError, match="without '#' is available"):
+        _headless_temp_root()
 
 
 def test_headless_timeout_raises_ghidra_error(tmp_path, monkeypatch):

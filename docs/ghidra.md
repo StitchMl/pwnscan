@@ -1,18 +1,28 @@
 # Ghidra workflow
 
-Keep `pwnscan` outside Ghidra for batch scans, CI, and reproducible tests. Use
-Ghidra after the CLI ranks an input, or invoke it through the optional headless
-adapter.
+Keep `pwnscan` outside Ghidra for batch scans, CI, and reproducible tests. If
+Ghidra is installed, pwnscan discovers it and invokes the headless adapter
+automatically. The CLI remains useful without Ghidra and reports its static
+findings in that case.
 
 ## Automatic headless analysis
 
 ```console
-pwnscan ./challenge --ghidra-auto --ghidra-home C:\Tools\ghidra_12.0_PUBLIC
+pwnscan ./challenge
+pwnscan ./challenge --no-ghidra-auto
 ```
 
-You may set `GHIDRA_HOME`. The adapter creates a temporary project, imports the
-binary, runs analysis, exports deterministic JSON, then deletes the project.
-The target is never executed. Use `--ghidra-timeout SECONDS` to bound analysis.
+Detection checks `PATH`, `GHIDRA_HOME`, and common install locations. Set
+`--ghidra-home` only for a nonstandard install. The adapter creates a temporary
+project, imports the binary, runs analysis, exports deterministic JSON, then
+deletes the project. The target is never executed. Use `--ghidra-timeout
+SECONDS` to bound analysis. `--ghidra-auto` forces an error if Ghidra cannot be
+found; `--no-ghidra-auto` disables automatic analysis.
+
+The launcher also derives `JAVA_HOME` from a valid existing setting or the
+`java` executable on `PATH`. On Windows it gives the headless process a
+per-run `APPDATA` directory and chooses a temporary project location without
+characters Ghidra rejects; no machine-wide environment variables are changed.
 
 ## Manual export
 

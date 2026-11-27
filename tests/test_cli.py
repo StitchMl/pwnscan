@@ -1,7 +1,13 @@
 
+import pytest
 from test_parsers import minimal_elf64
 
 from pwnscan.cli import main
+
+
+@pytest.fixture(autouse=True)
+def disable_machine_ghidra_for_cli_tests(monkeypatch):
+    monkeypatch.setattr("pwnscan.cli.find_headless_executable", lambda _home: None)
 
 
 def test_cli_json(tmp_path, capsys):
@@ -56,6 +62,52 @@ def test_cli_runs_optional_headless_export(tmp_path, capsys, monkeypatch):
     captured = capsys.readouterr()
     assert '"schema":"pwnscan/v1"' in captured.out
     assert "running Ghidra headless analysis (timeout: 19s)" in captured.err
+
+
+def test_cli_detects_ghidra_and_runs_it_by_default(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    export = tmp_path / "generated.json"
+    export.write_text('{"schema":"pwnscan-ghidra/v1","functions":[],"imports":[],"calls":[]}', encoding="utf-8")
+    detected_home = tmp_path / "ghidra_12.0_PUBLIC"
+    calls = []
+
+    monkeypatch.setattr("pwnscan.cli.find_headless_executable", lambda _home: detected_home / "support" / "analyzeHeadless.bat")
+
+    def fake_export(actual_target, home, script, timeout):
+        calls.append((actual_target, home, script, timeout))
+        return export
+
+    monkeypatch.setattr("pwnscan.cli.export_headless", fake_export)
+    assert main([str(target), "--format", "json"]) == 0
+    assert calls == [(target, None, None, 300)]
+    assert not export.exists()
+    assert "running Ghidra headless analysis" in capsys.readouterr().err
+
+
+def test_cli_can_disable_automatic_ghidra(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64())
+    monkeypatch.setattr("pwnscan.cli.find_headless_executable", lambda _home: pytest.fail("unexpected Ghidra lookup"))
+    assert main([str(target), "--no-ghidra-auto", "--format", "json"]) == 0
+    assert '"schema":"pwnscan/v1"' in capsys.readouterr().out
+
+
+def test_cli_falls_back_when_detected_ghidra_cannot_start(tmp_path, capsys, monkeypatch):
+    from pwnscan.ghidra import GhidraError
+
+    target = tmp_path / "challenge"
+    target.write_bytes(minimal_elf64(b"gets\0"))
+    monkeypatch.setattr("pwnscan.cli.find_headless_executable", lambda _home: tmp_path / "headless")
+
+    def fail_start(*_args):
+        raise GhidraError("JDK unavailable")
+
+    monkeypatch.setattr("pwnscan.cli.export_headless", fail_start)
+    assert main([str(target), "--format", "json"]) == 0
+    captured = capsys.readouterr()
+    assert '"schema":"pwnscan/v1"' in captured.out
+    assert "continuing with static triage: JDK unavailable" in captured.err
 
 
 def test_cli_rejects_two_ghidra_sources(tmp_path, capsys):

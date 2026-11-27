@@ -14,10 +14,17 @@ from .ghidra import (
     GhidraError,
     default_cache_path,
     export_headless,
+    find_headless_executable,
     is_cache_valid,
     write_cached_export,
 )
-from .report import render_batch_markdown, render_json, render_markdown, render_text, use_color
+from .report import (
+    render_batch_markdown,
+    render_json,
+    render_markdown,
+    render_text,
+    use_color,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -42,7 +49,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--output", "-o", type=Path, metavar="FILE", help="write report to a file instead of stdout")
     result.add_argument("--min-severity", choices=("critical", "high", "medium", "low", "info"), help="only include findings at this severity or higher")
     result.add_argument("--ghidra", type=Path, metavar="EXPORT.json", help="merge deterministic metadata exported by PwnscanExport.java")
-    result.add_argument("--ghidra-auto", action="store_true", help="run optional Ghidra headless analysis and merge its export")
+    ghidra_mode = result.add_mutually_exclusive_group()
+    ghidra_mode.add_argument("--ghidra-auto", dest="ghidra_auto", action="store_true", default=None,
+                             help="run Ghidra headless analysis (also detected automatically when installed)")
+    ghidra_mode.add_argument("--no-ghidra-auto", dest="ghidra_auto", action="store_false",
+                             help="disable automatic Ghidra analysis")
     result.add_argument("--ghidra-cache", action="store_true", help="with --ghidra-auto, reuse or save <target>.ghidra.json (or --ghidra-keep) when up-to-date")
     result.add_argument("--ghidra-keep", type=Path, metavar="EXPORT.json", help="with --ghidra-auto, also save the generated Ghidra export to this file")
     result.add_argument("--ghidra-home", type=Path, help="Ghidra installation directory for --ghidra-auto")
@@ -54,6 +65,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _check_args(args: argparse.Namespace) -> None:
+    _check_ghidra_options(args)
+    _check_output_paths(args)
+    _check_target_options(args)
+
+
+def _check_ghidra_options(args: argparse.Namespace) -> None:
     if args.ghidra and args.ghidra_auto:
         raise ValueError("choose either --ghidra or --ghidra-auto")
     if args.ghidra_keep and not args.ghidra_auto:
@@ -66,10 +83,16 @@ def _check_args(args: argparse.Namespace) -> None:
             raise ValueError("invalid Ghidra export path: %s" % args.ghidra_keep)
     if args.ghidra_timeout < 1:
         raise ValueError("--ghidra-timeout must be positive")
+
+
+def _check_output_paths(args: argparse.Namespace) -> None:
     if args.output is not None:
         output = args.output.resolve()
         if output.is_dir() or not output.parent.is_dir():
             raise ValueError("invalid output path: %s" % args.output)
+
+
+def _check_target_options(args: argparse.Namespace) -> None:
     if args.target.is_dir() and (args.ghidra is not None or args.ghidra_keep is not None):
         raise ValueError("--ghidra and --ghidra-keep cannot be used with a directory target")
 
@@ -91,19 +114,46 @@ def _filtered(args: argparse.Namespace, report):
 
 
 def _resolve_ghidra_export(target: Path, args: argparse.Namespace) -> tuple[Optional[Path], Optional[Path]]:
-    if not args.ghidra_auto:
-        if args.ghidra is not None:
-            return args.ghidra, None
-        if args.target.is_dir():
-            sidecar = default_cache_path(target)
-            return (sidecar, None) if sidecar.is_file() else (None, None)
-        return None, None
+    if args.ghidra is not None:
+        return args.ghidra, None
+    automatic = args.ghidra_auto is None
+    auto = _automatic_ghidra_enabled(args)
+    if not auto:
+        return _sidecar_export(target, args)
     cache_path = args.ghidra_keep.resolve() if args.ghidra_keep is not None else default_cache_path(target)
     if args.ghidra_cache and is_cache_valid(target, cache_path):
         print("pwnscan: reusing cached Ghidra export %s" % cache_path, file=sys.stderr)
         return cache_path, None
+    return _run_ghidra_export(target, args, automatic, cache_path)
+
+
+def _automatic_ghidra_enabled(args: argparse.Namespace) -> bool:
+    if args.ghidra_auto is not None:
+        return args.ghidra_auto
+    found = find_headless_executable(args.ghidra_home) is not None
+    if not found and args.ghidra_home is not None:
+        raise GhidraError("no Ghidra headless executable found under --ghidra-home")
+    return found
+
+
+def _sidecar_export(target: Path, args: argparse.Namespace) -> tuple[Optional[Path], Optional[Path]]:
+    if not args.target.is_dir():
+        return None, None
+    sidecar = default_cache_path(target)
+    return (sidecar, None) if sidecar.is_file() else (None, None)
+
+
+def _run_ghidra_export(target: Path, args: argparse.Namespace, automatic: bool,
+                       cache_path: Path) -> tuple[Optional[Path], Optional[Path]]:
     print("pwnscan: running Ghidra headless analysis (timeout: %ds)..." % args.ghidra_timeout, file=sys.stderr)
-    generated = export_headless(target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
+    try:
+        generated = export_headless(target, args.ghidra_home, args.ghidra_script, args.ghidra_timeout)
+    except (OSError, GhidraError) as exc:
+        if not automatic:
+            raise
+        print("pwnscan: automatic Ghidra analysis unavailable; continuing with static triage: %s" % exc,
+              file=sys.stderr)
+        return None, None
     if args.ghidra_cache:
         write_cached_export(target, generated, cache_path)
     elif args.ghidra_keep is not None:
