@@ -19,8 +19,9 @@ GLOBAL_ID = "global:%s"
 UNBOUNDED = {"gets": "reads an unbounded line", "strcpy": "copies without a length", "stpcpy": "copies without a length", "strcat": "appends without a length", "sprintf": "formats without a destination length", "vsprintf": "formats without a destination length", "scanf": UNBOUNDED_FORMAT, "sscanf": UNBOUNDED_FORMAT, "fscanf": UNBOUNDED_FORMAT, "__isoc99_scanf": UNBOUNDED_FORMAT, "__isoc99_sscanf": UNBOUNDED_FORMAT, "__isoc99_fscanf": UNBOUNDED_FORMAT}
 FORMAT_SINKS = {"printf", "fprintf", "dprintf", "sprintf", "snprintf", "asprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "vasprintf", "syslog"}
 FORMAT_INDEXES = {
-    "printf": 0, "vprintf": 0,
+    "printf": 0, "vprintf": 0, "warn": 0, "warnx": 0, "vwarn": 0, "vwarnx": 0,
     "fprintf": 1, "dprintf": 1, "sprintf": 1, "asprintf": 1, "vfprintf": 1, "vsprintf": 1, "vasprintf": 1, "syslog": 1,
+    "err": 1, "errx": 1, "verr": 1, "verrx": 1,
     "snprintf": 2, "vsnprintf": 2,
     "printf_chk": 1, "vprintf_chk": 1,
     "fprintf_chk": 2, "dprintf_chk": 2, "vfprintf_chk": 2, "asprintf_chk": 2, "vasprintf_chk": 2,
@@ -63,22 +64,29 @@ HEAP_DEREFERENCE_ARGUMENTS = {
 }
 INPUT_FILLERS = {
     "read": 1, "recv": 1, "recvfrom": 1, "pread": 1, "pread64": 1,
-    "fgets": 0, "gets": 0,
+    "read_chk": 1, "recv_chk": 1, "recvfrom_chk": 1,
+    "fgets": 0, "fgets_chk": 0, "gets": 0, "gets_chk": 0, "fread": 0,
     "scanf": 1, "isoc99_scanf": 1, "sscanf": 2, "isoc99_sscanf": 2,
     "fscanf": 2, "isoc99_fscanf": 2,
+}
+FILLER_LENGTH_INDEX = {
+    "read": 2, "recv": 2, "recvfrom": 2, "pread": 2, "pread64": 2,
+    "read_chk": 2, "recv_chk": 2, "recvfrom_chk": 2,
+    "fgets": 1, "fgets_chk": 2, "gets_chk": 1,
 }
 SCANF_FORMAT_INDEX = {
     "scanf": 0, "__isoc99_scanf": 0, "vscanf": 0,
     "sscanf": 1, "__isoc99_sscanf": 1, "vsscanf": 1,
     "fscanf": 1, "__isoc99_fscanf": 1, "vfscanf": 1,
 }
-SCANF_SPEC_RE = re.compile(r"%(\*)?(?:\d+\$)?(\d+)?(?:hh|h|ll|l|j|z|t|L|m|a)?([diuoxXfFeEgGaAcspn\[])")
+SCANF_SPEC_RE = re.compile(r"%(\*)?(?:\d+\$)?(\d+)?(?:(m)|hh|h|ll|l|j|z|t|L|a)?([diuoxXfFeEgGaAcspn\[])")
 CRT_FUNCTIONS = frozenset({
     "_init", "_fini", "_start", "__libc_csu_init", "__libc_csu_fini",
     "__do_global_dtors_aux", "deregister_tm_clones", "register_tm_clones",
     "frame_dummy", "_dl_relocate_static_pie",
 })
 STANDARD_FILE_STREAMS = frozenset({"stdin", "stdout", "stderr"})
+FILE_STREAM_CREATORS = {"fopen", "fopen64", "fdopen", "freopen", "freopen64"}
 FILE_STREAM_ARGS = {
     "fclose": {0}, "fflush": {0}, "fseek": {0}, "ftell": {0}, "rewind": {0},
     "feof": {0}, "ferror": {0}, "clearerr": {0}, "fileno": {0}, "setbuf": {0}, "setvbuf": {0},
@@ -94,6 +102,7 @@ FILE_WRITE_DESTS = {
 ARITHMETIC_WRAP_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT", "INT_SUB"}
 WIDTH_CHANGE_OPS = {"INT_SEXT", "SUBPIECE"}
 WIN_NAMES = re.compile(r"(?:^|[^a-z])(win|print[_-]?flag|give[_-]?flag|shell|secret)(?:[^a-z]|$)", re.I)
+PRIMARY_WIN_NAMES = re.compile(r"(?:^|[^a-z])(?:win|print[_-]?flag|give[_-]?flag|shell)(?:[^a-z]|$)", re.I)
 FLAG_TEXT = re.compile(r"(?:flag|ctf|secret|password|/bin/sh|cat\s+[^\s]*flag)", re.I)
 FLAG_OPEN_NAMES = {"open", "open64", "openat", "fopen"}
 FLAG_FD_SINKS = {"sendfile": 1, "write": 0, "pwrite": 0, "send": 0, "sendto": 0, "fwrite": 3}
@@ -126,7 +135,7 @@ def _expand_name_set(names: set) -> None:
 
 for _table in (UNBOUNDED, FORMAT_INDEXES, BOUNDED_WRITES, HEAP_DEREFERENCE_ARGUMENTS, INPUT_FILLERS, SCANF_FORMAT_INDEX, FILE_STREAM_ARGS, FILE_WRITE_DESTS, FLAG_FD_SINKS, COMMAND_ARG_INDEXES):
     _expand_name_table(_table)
-for _names in (FORMAT_SINKS, COMMAND_SINKS, VARARG_COMMAND_SINKS, DEALLOCATORS, FLAG_OPEN_NAMES, OUTPUT_STRING_NAMES):
+for _names in (FORMAT_SINKS, COMMAND_SINKS, VARARG_COMMAND_SINKS, DEALLOCATORS, FLAG_OPEN_NAMES, OUTPUT_STRING_NAMES, FILE_STREAM_CREATORS):
     _expand_name_set(_names)
 
 
@@ -281,6 +290,11 @@ def _global_identity(argument: dict) -> str | None:
     return _expression_global(expr) if isinstance(expr, dict) else None
 
 
+def _intra_block_key(call: dict) -> tuple[int, int]:
+    order = call.get("order")
+    return _call_sort_key(call), order if isinstance(order, int) else 0
+
+
 def _can_reach_call(cfg: dict, function: str, src: dict, dst: dict) -> bool:
     """Return True if dst is reachable from src according to CFG (or address order if CFG is unavailable)."""
     fn_cfg = cfg.get(function) if isinstance(cfg, dict) else None
@@ -289,9 +303,7 @@ def _can_reach_call(cfg: dict, function: str, src: dict, dst: dict) -> bool:
     dst_block = dst.get("block")
     if isinstance(blocks, dict) and isinstance(src_block, int) and isinstance(dst_block, int):
         if src_block == dst_block:
-            src_key = (src.get("order", _call_sort_key(src)), _call_sort_key(src))
-            dst_key = (dst.get("order", _call_sort_key(dst)), _call_sort_key(dst))
-            return src_key < dst_key
+            return _intra_block_key(src) < _intra_block_key(dst)
         return _block_can_reach(blocks, src_block, dst_block)
     return _call_sort_key(src) < _call_sort_key(dst)
 
@@ -305,13 +317,31 @@ def _call_position(call: dict) -> tuple[str, int, str]:
     return str(call.get("function") or ""), numeric, value
 
 
+def _record_global_free(call: dict, function: str, global_id: str, matched_local: bool, double_free: list, cfg: dict, global_freed: dict) -> None:
+    prev_globals = global_freed.setdefault(global_id, [])
+    for prev_fn, prev_call in prev_globals:
+        if prev_fn != function:
+            double_free.append(
+                "%s frees global %s at %s (also freed in %s at %s)"
+                % (function, global_id, call.get("from"), prev_fn, prev_call.get("from"))
+            )
+        elif not matched_local and _can_reach_call(cfg, function, prev_call, call):
+            double_free.append(
+                "%s frees global %s at %s after an earlier free at %s"
+                % (function, global_id, call.get("from"), prev_call.get("from"))
+            )
+    prev_globals.append((function, call))
+
+
 def _record_free(call: dict, function: str, freed: dict, double_free: list, cfg: dict, global_freed: dict) -> None:
     arg0 = _call_argument(call, 0)
     identity = _argument_identity(arg0)
+    matched_local = False
     if identity is not None:
         key = function, identity
         previous = freed.get(key)
         if previous is not None and _can_reach_call(cfg, function, previous, call):
+            matched_local = True
             double_free.append(
                 "%s frees %s at %s after an earlier free at %s"
                 % (function, identity, call.get("from"), previous.get("from"))
@@ -320,14 +350,7 @@ def _record_free(call: dict, function: str, freed: dict, double_free: list, cfg:
             freed[key] = call
     global_id = _global_identity(arg0)
     if global_id is not None:
-        prev_globals = global_freed.setdefault(global_id, [])
-        for prev_fn, prev_call in prev_globals:
-            if prev_fn != function:
-                double_free.append(
-                    "%s frees global %s at %s (also freed in %s at %s)"
-                    % (function, global_id, call.get("from"), prev_fn, prev_call.get("from"))
-                )
-        prev_globals.append((function, call))
+        _record_global_free(call, function, global_id, matched_local, double_free, cfg, global_freed)
 
 
 def _call_sort_key(call: dict) -> int:
@@ -397,7 +420,7 @@ def _record_freed_use(state: _HeapState, call: dict, function: str, name: str, i
         )
 
 
-def _record_global_use(state: _HeapState, call: dict, function: str, name: str, index: int, arg: dict) -> None:
+def _record_global_use(state: _HeapState, call: dict, function: str, name: str, index: int, arg: dict, matched_local: bool) -> None:
     global_id = _global_identity(arg)
     if global_id is None:
         return
@@ -407,6 +430,8 @@ def _record_global_use(state: _HeapState, call: dict, function: str, name: str, 
                 "%s passes global %s (freed in %s at %s) to %s argument %d at %s"
                 % (function, global_id, free_fn, free_call.get("from"), name, index, call.get("from"))
             )
+        elif not matched_local and _can_reach_call(state.cfg, function, free_call, call):
+            _record_freed_use(state, call, function, name, index, global_id, free_call)
 
 
 def _record_dereferences(state: _HeapState, call: dict, function: str, name: str) -> None:
@@ -414,9 +439,10 @@ def _record_dereferences(state: _HeapState, call: dict, function: str, name: str
         arg = _call_argument(call, index)
         identity = _argument_identity(arg)
         previous = state.freed.get((function, identity or ""))
-        if previous is not None and _can_reach_call(state.cfg, function, previous, call):
+        matched_local = previous is not None and _can_reach_call(state.cfg, function, previous, call)
+        if matched_local:
             _record_freed_use(state, call, function, name, index, identity, previous)
-        _record_global_use(state, call, function, name, index, arg)
+        _record_global_use(state, call, function, name, index, arg, matched_local)
 
 
 def _release_reassigned(state: _HeapState, call: dict, function: str, name: str) -> None:
@@ -527,6 +553,56 @@ def _boundary_writes(calls: Sequence[dict]) -> list[dict]:
     return result
 
 
+def _win_symbol_rank(name: str) -> tuple[int, str]:
+    priority = 0 if PRIMARY_WIN_NAMES.search(name) else 1
+    return priority, name.lower()
+
+
+def _select_ret2win_target(info: BinaryInfo, win_symbols: Sequence[str], symbol_addresses: dict) -> Optional[tuple[str, int]]:
+    function_symbols = set(info.metadata.get("function_symbols") or ())
+    candidate_names = [name for name in win_symbols if name in function_symbols] if function_symbols else list(win_symbols)
+    addressed = [
+        (name, symbol_addresses.get(name))
+        for name in sorted(candidate_names, key=_win_symbol_rank)
+    ]
+    valid = [(name, address) for name, address in addressed if isinstance(address, int) and address > 0]
+    return valid[0] if valid else None
+
+
+def _ret2win_effective_bytes(item: dict, target_bytes: bytes) -> Optional[int]:
+    if item["name"] in {"fgets", "fgets_chk"}:
+        if b"\n" in target_bytes:
+            return None
+        return int(item["requested"]) - 1
+    return int(item["requested"])
+
+
+def _usable_ret2win_offset(item: dict, target_bytes: bytes, pointer_size: int) -> Optional[tuple[int, int]]:
+    return_offset = item["destination"].get("return_address_offset")
+    effective_bytes = _ret2win_effective_bytes(item, target_bytes)
+    if not isinstance(return_offset, int) or return_offset <= 0 or effective_bytes is None:
+        return None
+    if effective_bytes < return_offset + pointer_size:
+        return None
+    return return_offset, effective_bytes
+
+
+def _append_aligned_ret2win(
+    info: BinaryInfo, return_offset: int, pointer_size: int, effective_bytes: int,
+    item_name: str, target_bytes: bytes, evidence: list[str], vector: str,
+) -> str:
+    ret_gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
+    if not ret_gadgets or effective_bytes < return_offset + 2 * pointer_size:
+        return vector
+    ret_addr = ret_gadgets[0]
+    ret_bytes = ret_addr.to_bytes(pointer_size, info.endian)
+    if item_name in {"fgets", "fgets_chk"} and b"\n" in ret_bytes:
+        return vector
+    aligned = (b"A" * return_offset) + ret_bytes + target_bytes
+    evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
+    return vector + " If x86_64 movaps alignment fails, use aligned_payload_hex=%s (prepends ret gadget 0x%x)." % (aligned.hex(), ret_addr)
+
+
 def _exact_ret2win(info: BinaryInfo, bounded: Sequence[dict], win_symbols: Sequence[str], symbol_addresses: dict) -> Finding | None:
     target = _ret2win_target(info, win_symbols, symbol_addresses)
     if target is None:
@@ -547,19 +623,22 @@ def _ret2win_target(info: BinaryInfo, win_symbols: Sequence[str], symbol_address
         return None
     if info.bits not in {32, 64} or info.endian not in {"little", "big"}:
         return None
-    symbols = set(info.metadata.get("function_symbols") or ())
-    names = [name for name in win_symbols if name in symbols] if symbols else list(win_symbols)
-    return next(((name, address, address_key) for name in names
-                 if isinstance(address := symbol_addresses.get(name), int) and address > 0), None)
+    selected = _select_ret2win_target(info, win_symbols, symbol_addresses)
+    if selected is None:
+        return None
+    chosen_name, chosen_address = selected
+    return chosen_name, chosen_address, address_key
 
 
 def _ret2win_finding(info: BinaryInfo, item: dict, name: str, address: int,
                      address_key: str, pointer_size: int) -> Finding | None:
-    offset = item["destination"].get("return_address_offset")
-    if not isinstance(offset, int) or offset <= 0 or item["requested"] < offset + pointer_size:
+    target_bytes = address.to_bytes(pointer_size, info.endian)
+    usable = _usable_ret2win_offset(item, target_bytes, pointer_size)
+    if usable is None:
         return None
+    offset, effective_bytes = usable
     call = item["call"]
-    payload = b"A" * offset + address.to_bytes(pointer_size, info.endian)
+    payload = b"A" * offset + target_bytes
     payload_hex = payload.hex()
     evidence = [
         "Ghidra recovered saved return address offset %d for %s at %s" % (offset, item["name"], call.get("from")),
@@ -569,12 +648,7 @@ def _ret2win_finding(info: BinaryInfo, item: dict, name: str, address: int,
     vector = "payload_hex=%s; send bytes.fromhex(\"%s\") to the input consumed by %s at %s." % (
         payload_hex, payload_hex, item["name"], call.get("from"),
     )
-    gadgets = info.metadata.get("gadgets", {}).get("ret", []) if info.architecture == "x86_64" else []
-    if gadgets and item["requested"] >= offset + 2 * pointer_size:
-        ret_addr = gadgets[0]
-        aligned = b"A" * offset + ret_addr.to_bytes(pointer_size, info.endian) + address.to_bytes(pointer_size, info.endian)
-        evidence.append("x86_64 ret gadget available at 0x%x for 16-byte stack alignment" % ret_addr)
-        vector += " If x86_64 movaps alignment fails, use aligned_payload_hex=%s (prepends ret gadget 0x%x)." % (aligned.hex(), ret_addr)
+    vector = _append_aligned_ret2win(info, offset, pointer_size, effective_bytes, item["name"], target_bytes, evidence, vector)
     return _finding(
         "PWN-FLAG-CHAIN-001", "Verified direct flag-path overwrite", "critical", "high",
         evidence, vector,
@@ -878,65 +952,91 @@ def _check_snprintf_return_misuse(ghidra_calls: Sequence[dict], cfg: dict | None
     )
 
 
+def _const_positive_arg(call: dict, index: int) -> Optional[int]:
+    arg = _call_argument(call, index)
+    val = arg.get("value") if arg.get("kind") == "constant" else None
+    return val if isinstance(val, int) and val > 0 else None
+
+
 def _allocated_chunk_size(call: dict, name: str) -> Optional[int]:
-    indexes = {"malloc": (0,), "realloc": (1,), "calloc": (0, 1)}.get(name)
-    if indexes is None:
-        return None
-    values = [_constant_argument(_call_argument(call, index)) for index in indexes]
-    if any(value is None or value <= 0 for value in values):
-        return None
-    return values[0] if len(values) == 1 else values[0] * values[1]
+    if name in {"malloc", "operator new", "operator new[]", "new"}:
+        return _const_positive_arg(call, 0)
+    if name in {"realloc", "aligned_alloc", "memalign"}:
+        return _const_positive_arg(call, 1)
+    if name == "posix_memalign":
+        return _const_positive_arg(call, 2)
+    if name == "calloc":
+        v0, v1 = _const_positive_arg(call, 0), _const_positive_arg(call, 1)
+        if v0 is not None and v1 is not None:
+            return v0 * v1
+    return None
 
 
-def _constant_argument(argument: dict) -> Optional[int]:
-    value = argument.get("value") if argument.get("kind") == "constant" else None
-    return value if isinstance(value, int) else None
+def _allocator_target_identities(call: dict, name: str) -> set[str]:
+    if name == "posix_memalign":
+        out_id = _argument_identity(_call_argument(call, 0))
+        return {out_id} if out_id else set()
+    return _return_var_identities(call)
 
 
 def _update_chunk_sizes(call: dict, function: str, name: str, chunk_sizes: dict) -> None:
     size = _allocated_chunk_size(call, name)
-    for identity in _return_var_identities(call):
+    for identity in _allocator_target_identities(call, name):
         if size is not None:
-            chunk_sizes[(function, identity)] = size
+            chunk_sizes[(function, identity)] = (size, call)
         else:
             chunk_sizes.pop((function, identity), None)
 
 
-def _heap_chunk_overflows(calls: Sequence[dict]) -> list[dict]:
-    chunk_sizes: dict[tuple[str, str], int] = {}
-    overflows: list[dict] = []
-    for call in sorted(calls, key=lambda item: (str(item.get("function") or ""), _call_sort_key(item), str(item.get("from") or ""))):
-        function = call.get("function") or UNKNOWN
-        name = _call_name(call)
-        overflow = _heap_call_overflow(call, function, name, chunk_sizes)
-        if overflow is not None:
-            overflows.append(overflow)
-    return overflows
+def _chunk_sort_key(call: dict) -> tuple[str, int, int, str]:
+    order = call.get("order")
+    return str(call.get("function") or ""), _call_sort_key(call), order if isinstance(order, int) else 0, str(call.get("from") or "")
 
 
-def _heap_call_overflow(call: dict, function: str, name: str,
-                        chunk_sizes: dict[tuple[str, str], int]) -> Optional[dict]:
-    if name in {"malloc", "calloc", "realloc"}:
-        _update_chunk_sizes(call, function, name, chunk_sizes)
-        return None
-    if name in DEALLOCATORS:
-        freed_id = _argument_identity(_call_argument(call, 0))
-        if freed_id:
-            chunk_sizes.pop((function, freed_id), None)
-        return None
+def _drop_freed_chunk_size(call: dict, function: str, chunk_sizes: dict, cfg_map: dict) -> None:
+    freed_id = _argument_identity(_call_argument(call, 0))
+    if not freed_id:
+        return
+    entry = chunk_sizes.get((function, freed_id))
+    if entry is not None and _can_reach_call(cfg_map, function, entry[1], call):
+        chunk_sizes.pop((function, freed_id), None)
+
+
+def _chunk_overflow_hit(call: dict, function: str, name: str, chunk_sizes: dict, cfg_map: dict) -> Optional[dict]:
     request = _write_request(call, name)
     if request is None:
         return None
     dest_idx, requested = request
     dest_id = _argument_identity(_call_argument(call, dest_idx))
-    capacity = chunk_sizes.get((function, dest_id)) if dest_id else None
-    if capacity is None or requested <= capacity:
+    if not dest_id:
         return None
-    return {"call": call, "name": name, "capacity": capacity, "requested": requested}
+    entry = chunk_sizes.get((function, dest_id))
+    if entry is not None and requested > entry[0] and _can_reach_call(cfg_map, function, entry[1], call):
+        return {"call": call, "name": name, "capacity": entry[0], "requested": requested}
+    return None
 
 
-def _check_heap_overflows(ghidra_calls: Sequence[dict]) -> Optional[Finding]:
-    overflows = _heap_chunk_overflows(ghidra_calls)
+def _heap_chunk_overflows(calls: Sequence[dict], cfg: dict | None = None) -> list[dict]:
+    cfg_map = cfg if isinstance(cfg, dict) else {}
+    chunk_sizes: dict[tuple[str, str], tuple[int, dict]] = {}
+    overflows: list[dict] = []
+    for call in sorted(calls, key=_chunk_sort_key):
+        function = str(call.get("function") or UNKNOWN)
+        name = _call_name(call)
+        if name in ALLOCATORS:
+            _update_chunk_sizes(call, function, name, chunk_sizes)
+            continue
+        if name in DEALLOCATORS:
+            _drop_freed_chunk_size(call, function, chunk_sizes, cfg_map)
+            continue
+        hit = _chunk_overflow_hit(call, function, name, chunk_sizes, cfg_map)
+        if hit is not None:
+            overflows.append(hit)
+    return overflows
+
+
+def _check_heap_overflows(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
+    overflows = _heap_chunk_overflows(ghidra_calls, cfg)
     if not overflows:
         return None
     evidence = [
@@ -1079,6 +1179,24 @@ def _scanf_width_overflows(call: dict, dest_index: int, width_text: str) -> bool
     return isinstance(capacity, int) and capacity > 0 and int(width_text) + 1 > capacity
 
 
+def _scanf_char_width_overflows(call: dict, dest_index: int, width_text: str) -> bool:
+    if not width_text:
+        return False
+    dest = _call_argument(call, dest_index)
+    capacity = dest.get("buffer_size") or dest.get("return_address_offset")
+    return isinstance(capacity, int) and capacity > 0 and int(width_text) > capacity
+
+
+def _scanf_spec_overflows(call: dict, dest_index: int, width_text: Optional[str], alloc_mod: Optional[str], conversion: str) -> bool:
+    if alloc_mod == "m" and conversion in {"s", "[", "c"}:
+        return False
+    if conversion in {"s", "["}:
+        return _scanf_width_overflows(call, dest_index, width_text or "")
+    if conversion == "c":
+        return _scanf_char_width_overflows(call, dest_index, width_text or "")
+    return False
+
+
 def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
     format_arg = _call_argument(call, format_index)
     format_str = format_arg.get("string") if format_arg.get("kind") == "address_constant" else None
@@ -1086,10 +1204,10 @@ def _scanf_call_is_bounded(call: dict, format_index: int) -> bool:
         return False
     dest_index = format_index + 1
     for match in SCANF_SPEC_RE.finditer(format_str.replace("%%", "")):
-        suppressed, width_text, conversion = match.groups()
+        suppressed, width_text, alloc_mod, conversion = match.groups()
         if suppressed:
             continue
-        if conversion in {"s", "["} and _scanf_width_overflows(call, dest_index, width_text):
+        if _scanf_spec_overflows(call, dest_index, width_text, alloc_mod, conversion):
             return False
         dest_index += 1
     return True
@@ -1107,10 +1225,32 @@ def _bounded_scanf_imports(ghidra_calls: Sequence[dict]) -> set[str]:
     }
 
 
+def _effective_string_hints(
+    info: BinaryInfo, parsed_imports: set[str], ghidra_calls: Sequence[dict], string_hints: set[str],
+) -> set[str]:
+    if info.metadata.get("dynamic") is False:
+        return string_hints
+    if parsed_imports and ghidra_calls:
+        return set()
+    return string_hints
+
+
+def _unbounded_vector(info: BinaryInfo) -> str:
+    nx = info.mitigations.get("nx")
+    canary = info.mitigations.get("stack_canary")
+    if canary is False and nx is False:
+        return "Find the overwrite offset, control the return address, then jump to injected stack data or a win function."
+    if canary is False:
+        return "Find the overwrite offset, control the return address, then build a ROP/ret2libc chain or jump to a win function."
+    return "Trace attacker-controlled lengths to the destination. If a stack canary blocks return-address control, target adjacent data or leak the canary first."
+
+
 def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports: set[str], string_hints: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
     bounded_scanf = _bounded_scanf_imports(ghidra_calls)
+    effective_hints = _effective_string_hints(info, parsed_imports, ghidra_calls, string_hints)
+    candidate_imports = (imports - string_hints) | effective_hints
     dangerous = sorted(
-        (name for name in imports & set(UNBOUNDED) if _strip_underscores(name) not in bounded_scanf),
+        (name for name in candidate_imports & set(UNBOUNDED) if _strip_underscores(name) not in bounded_scanf),
         key=str.lower,
     )
     if not dangerous:
@@ -1119,20 +1259,14 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
     proven = sorted(dangerous_set & parsed_imports, key=str.lower)
     callsites = [item for item in ghidra_calls if _call_name(item) in dangerous_set]
     resolved_names = set(proven) | {_call_name(item) for item in callsites}
-    hints = sorted((dangerous_set & string_hints) - resolved_names, key=str.lower)
+    hints = sorted((dangerous_set & effective_hints) - resolved_names, key=str.lower)
     reasons = (
         ["parsed import: %s (%s)" % (name, UNBOUNDED[name]) for name in proven]
         + ["unverified string hint: %s" % name for name in hints]
         + ["Ghidra reference: %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to")) for item in callsites]
     )
-    nx = info.mitigations.get("nx")
-    canary = info.mitigations.get("stack_canary")
-    if canary is False and nx is False:
-        vector = "Find the overwrite offset, control the return address, then jump to injected stack data or a win function."
-    elif canary is False:
-        vector = "Find the overwrite offset, control the return address, then build a ROP/ret2libc chain or jump to a win function."
-    else:
-        vector = "Trace attacker-controlled lengths to the destination. If a stack canary blocks return-address control, target adjacent data or leak the canary first."
+    if not reasons:
+        return None
     if callsites and "gets" in proven:
         level = "high"
     elif proven:
@@ -1140,7 +1274,7 @@ def _check_unbounded_writes(info: BinaryInfo, imports: set[str], parsed_imports:
     else:
         level = "low"
     return _finding(
-        "PWN-BOF-001", "Unbounded memory-write surface", level, level, reasons, vector,
+        "PWN-BOF-001", "Unbounded memory-write surface", level, level, reasons, _unbounded_vector(info),
         ["Inspect each call site and destination size.", "Generate a cyclic pattern in an isolated challenge runner.", "Confirm control of saved state with a debugger."],
         "Replace unbounded calls with length-aware APIs and reject input larger than the destination.",
     )
@@ -1158,7 +1292,19 @@ def _format_fillers(ghidra_calls: Sequence[dict]) -> list[tuple[str, str, dict]]
     return fillers
 
 
-def _filler_evidence(call: dict, fillers: list[tuple[str, str, dict]]) -> Optional[str]:
+def _filler_length(filler_call: dict) -> Optional[int]:
+    name = _call_name(filler_call)
+    if name == "fread":
+        return _fread_requested(filler_call)
+    idx = FILLER_LENGTH_INDEX.get(name)
+    if idx is None:
+        return None
+    arg = _call_argument(filler_call, idx)
+    val = arg.get("value") if arg.get("kind") == "constant" else None
+    return val if isinstance(val, int) and val > 0 else None
+
+
+def _filler_evidence(call: dict, fillers: list[tuple[str, str, dict]], cfg_map: dict) -> Optional[str]:
     argument = _call_argument(call, FORMAT_INDEXES[_call_name(call)])
     if not _dynamic_argument(argument):
         return None
@@ -1167,35 +1313,36 @@ def _filler_evidence(call: dict, fillers: list[tuple[str, str, dict]]) -> Option
         return None
     function = str(call.get("function") or UNKNOWN)
     for filler_function, filler_identity, filler_call in fillers:
-        if filler_function == function and filler_identity == identity:
-            length = _call_argument(filler_call, 2).get("value") if _call_name(filler_call) in {"read", "recv", "recvfrom"} else None
-            detail = " (%d bytes)" % length if isinstance(length, int) else ""
+        if filler_function == function and filler_identity == identity and _can_reach_call(cfg_map, function, filler_call, call):
+            length = _filler_length(filler_call)
+            detail = " (%d bytes)" % length if length is not None else ""
             return "format argument at %s is the buffer filled by %s at %s%s" % (
                 call.get("from"), _call_name(filler_call), filler_call.get("from"), detail,
             )
     return None
 
 
-def _format_input_sources(ghidra_calls: Sequence[dict]) -> dict[int, str]:
+def _format_input_sources(ghidra_calls: Sequence[dict], cfg: dict | None = None) -> dict[int, str]:
     """Map id() of a dynamic format call to evidence of the input call filling its format buffer."""
+    cfg_map = cfg if isinstance(cfg, dict) else {}
     fillers = _format_fillers(ghidra_calls)
     sources: dict[int, str] = {}
     for call in ghidra_calls:
         if _call_name(call) not in FORMAT_INDEXES:
             continue
-        evidence = _filler_evidence(call, fillers)
+        evidence = _filler_evidence(call, fillers, cfg_map)
         if evidence is not None:
             sources[id(call)] = evidence
     return sources
 
 
-def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: set[str], ghidra_calls: Sequence[dict]) -> Optional[Finding]:
+def _check_format_strings(info: BinaryInfo, imports: set[str], parsed_imports: set[str], ghidra_calls: Sequence[dict], cfg: dict | None = None) -> Optional[Finding]:
     dynamic_format_calls = [
         call for call in ghidra_calls
         if _call_name(call) in FORMAT_INDEXES and _dynamic_argument(_call_argument(call, FORMAT_INDEXES[_call_name(call)]))
     ]
     if dynamic_format_calls:
-        sources = _format_input_sources(ghidra_calls)
+        sources = _format_input_sources(ghidra_calls, cfg)
         call_evidence = [
             "dynamic format argument at %s in %s -> %s" % (item.get("from"), item.get("function") or UNKNOWN, item.get("to"))
             for item in dynamic_format_calls
@@ -1258,7 +1405,7 @@ def _check_command_sinks(parsed_imports: set[str], ghidra_calls: Sequence[dict])
 
 
 def _win_address_note(info: BinaryInfo, win_symbols: Sequence[str], symbol_addresses: dict) -> str:
-    addressed = [(name, symbol_addresses[name]) for name in win_symbols if name in symbol_addresses]
+    addressed = [(name, symbol_addresses[name]) for name in sorted(win_symbols, key=_win_symbol_rank) if name in symbol_addresses]
     if addressed:
         chosen_name, chosen_address = addressed[0]
         pack = "p64" if info.bits == 64 else "p32"
@@ -1346,12 +1493,12 @@ def _check_mitigations(info: BinaryInfo) -> Optional[Finding]:
 
 def _note_stream_identity(function: str, argument: dict, local_streams: set, global_streams: set) -> None:
     identity = _argument_identity(argument)
-    if identity is None:
-        return
-    local_streams.add((function, identity))
+    if identity is not None:
+        local_streams.add((function, identity))
+    global_id = _global_identity(argument)
+    if global_id is not None:
+        global_streams.add(global_id)
     repr_text = argument.get("repr")
-    if identity.startswith("high:"):
-        global_streams.add(identity)
     if isinstance(repr_text, str) and repr_text.startswith("(ram,"):
         global_streams.add(REPR_ID % repr_text)
 
@@ -1361,8 +1508,12 @@ def _collect_file_stream_identities(ghidra_calls: Sequence[dict]) -> tuple[set[t
     global_streams: set[str] = set()
     for call in ghidra_calls:
         function = str(call.get("function") or UNKNOWN)
-        for index in FILE_STREAM_ARGS.get(_call_name(call), set()):
+        name = _call_name(call)
+        for index in FILE_STREAM_ARGS.get(name, set()):
             _note_stream_identity(function, _call_argument(call, index), local_streams, global_streams)
+        if name in FILE_STREAM_CREATORS:
+            for ret_id in _return_var_identities(call):
+                local_streams.add((function, ret_id))
     return local_streams, global_streams
 
 
@@ -1370,7 +1521,10 @@ def _is_file_stream_argument(argument: dict, function: str, local_streams: set[t
     if argument.get("high_name") in STANDARD_FILE_STREAMS:
         return True
     identity = _argument_identity(argument)
-    if identity is not None and ((function, identity) in local_streams or identity in global_streams):
+    if identity is not None and (function, identity) in local_streams:
+        return True
+    global_id = _global_identity(argument)
+    if global_id is not None and global_id in global_streams:
         return True
     repr_text = argument.get("repr")
     return isinstance(repr_text, str) and (REPR_ID % repr_text) in global_streams
@@ -1458,14 +1612,14 @@ def analyze(info: BinaryInfo) -> List[Finding]:
 
     candidates: List[Optional[Finding]] = [
         _check_bounded_overflows(bounded),
-        _check_heap_overflows(ghidra_calls),
+        _check_heap_overflows(ghidra_calls, ghidra_cfg),
         _check_boundary_writes(boundary),
         _check_integer_allocations(ghidra_calls, ghidra_cfg),
         _check_division(ghidra_calls),
         _check_width_conversions(ghidra_calls, ghidra_cfg),
         _check_snprintf_return_misuse(ghidra_calls, ghidra_cfg),
         _check_unbounded_writes(info, imports, parsed_imports, string_hints, ghidra_calls),
-        _check_format_strings(info, imports, parsed_imports, ghidra_calls),
+        _check_format_strings(info, imports, parsed_imports, ghidra_calls, ghidra_cfg),
         _check_file_streams(ghidra_calls, ghidra_cfg),
         _check_command_sinks(parsed_imports, ghidra_calls),
         _check_syscall_filter(info),

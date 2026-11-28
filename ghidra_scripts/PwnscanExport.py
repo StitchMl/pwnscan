@@ -18,6 +18,16 @@ def _signed(value, bits):
     return value - (1 << bits) if value & sign else value
 
 
+def _base_stack_offset(program, base, seen):
+    if base is None:
+        return None
+    base_reg = program.getRegister(base)
+    stack_reg = program.getCompilerSpec().getStackPointer()
+    if base_reg is not None and stack_reg is not None and base_reg == stack_reg:
+        return 0
+    return _stack_offset(program, base, seen)
+
+
 def _stack_offset(program, varnode, seen=None):
     if varnode is None:
         return None
@@ -36,18 +46,27 @@ def _stack_offset(program, varnode, seen=None):
     opcode = operation.getOpcode()
     if opcode in (PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INDIRECT):
         return _stack_offset(program, operation.getInput(0), seen)
-    if opcode in (PcodeOp.PTRSUB, PcodeOp.PTRADD):
-        base = operation.getInput(0)
-        offset = operation.getInput(1)
-        base_address = base.getAddress() if base is not None else None
-        base_reg = program.getRegister(base) if base is not None else None
-        stack_reg = program.getCompilerSpec().getStackPointer()
-        stack_base = (base_address is not None and base_address.isStackAddress()) or (
-            base_reg is not None and stack_reg is not None and base_reg == stack_reg
-        )
-        if offset is not None and offset.isConstant() and stack_base:
-            return _signed(offset.getOffset(), offset.getSize() * 8)
-        return _stack_offset(program, base, seen)
+    if opcode == PcodeOp.PTRSUB and operation.getNumInputs() >= 2:
+        base, offset = operation.getInput(0), operation.getInput(1)
+        if offset is None or not offset.isConstant():
+            return None
+        base_off = _base_stack_offset(program, base, seen)
+        return None if base_off is None else base_off + _signed(offset.getOffset(), offset.getSize() * 8)
+    if opcode == PcodeOp.PTRADD and operation.getNumInputs() >= 3:
+        base, index, elem_size = operation.getInput(0), operation.getInput(1), operation.getInput(2)
+        if index is None or not index.isConstant() or elem_size is None or not elem_size.isConstant():
+            return None
+        base_off = _base_stack_offset(program, base, seen)
+        return None if base_off is None else base_off + _signed(index.getOffset(), index.getSize() * 8) * elem_size.getOffset()
+    if opcode == PcodeOp.INT_ADD and operation.getNumInputs() >= 2:
+        lhs, rhs = operation.getInput(0), operation.getInput(1)
+        if rhs is not None and rhs.isConstant():
+            base_off = _base_stack_offset(program, lhs, seen)
+            return None if base_off is None else base_off + _signed(rhs.getOffset(), rhs.getSize() * 8)
+        if lhs is not None and lhs.isConstant():
+            base_off = _base_stack_offset(program, rhs, seen)
+            return None if base_off is None else base_off + _signed(lhs.getOffset(), lhs.getSize() * 8)
+        return None
     if opcode == PcodeOp.MULTIEQUAL:
         values = set(_stack_offset(program, operation.getInput(i), set(seen)) for i in range(operation.getNumInputs()))
         values.discard(None)
@@ -95,9 +114,16 @@ def _expression(varnode, depth=0, seen=None):
     inputs = []
     for index in range(operation.getNumInputs()):
         node = operation.getInput(index)
-        child = {"kind": "constant", "value": node.getOffset(), "size": node.getSize()} if node.isConstant() else {
-            "kind": "dynamic", "repr": str(node), "size": node.getSize()
-        }
+        if node.isConstant():
+            child = {"kind": "constant", "value": node.getOffset(), "size": node.getSize()}
+        else:
+            child = {"kind": "dynamic", "repr": str(node), "size": node.getSize()}
+            try:
+                high = node.getHigh()
+                if high is not None and high.getName() and high.getName() not in ("UNNAMED", "null"):
+                    child["high_name"] = high.getName()
+            except Exception:
+                pass
         nested = _expression(node, depth + 1, set(seen))
         if nested is not None:
             child["expression"] = nested

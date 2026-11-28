@@ -35,6 +35,8 @@ def test_headless_export_builds_isolated_command(tmp_path, monkeypatch):
         assert "-postScript" in captured["command"]
         assert captured["kwargs"]["timeout"] == 17
         assert captured["kwargs"]["check"] is False
+        assert captured["kwargs"]["encoding"] == "utf-8"
+        assert captured["kwargs"]["errors"] == "replace"
     finally:
         output.unlink(missing_ok=True)
 

@@ -455,9 +455,9 @@ def _gadget_patterns(bits: int, architecture: str) -> Dict[str, bytes]:
         patterns = {"ret": b"\xc3", "leave_ret": b"\xc9\xc3", "jmp_rsp": b"\xff\xe4", "syscall_ret": b"\x0f\x05\xc3"}
         if bits == 64:
             patterns.update({
-                "pop_rdi_ret": b"\x5f\xc3", "pop_rsi_ret": b"\x5e\xc3", "pop_rdx_ret": b"\x5a\xc3",
-                "pop_rax_ret": b"\x58\xc3", "pop_rcx_ret": b"\x59\xc3", "pop_rbx_ret": b"\x5b\xc3",
-                "pop_rbp_ret": b"\x5d\xc3",
+                "pop_rdi_ret": b"\x5f\xc3", "pop_rsi_ret": b"\x5e\xc3", "pop_rsi_r15_ret": b"\x5e\x41\x5f\xc3",
+                "pop_rdx_ret": b"\x5a\xc3", "pop_rax_ret": b"\x58\xc3", "pop_rcx_ret": b"\x59\xc3",
+                "pop_rbx_ret": b"\x5b\xc3", "pop_rbp_ret": b"\x5d\xc3",
             })
         elif bits == 32:
             patterns.update({

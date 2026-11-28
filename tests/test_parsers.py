@@ -553,6 +553,7 @@ def test_expanded_x86_and_x86_64_gadget_patterns():
     assert p64["pop_rcx_ret"] == b"\x59\xc3"
     assert p64["pop_rbx_ret"] == b"\x5b\xc3"
     assert p64["pop_rbp_ret"] == b"\x5d\xc3"
+    assert p64["pop_rsi_r15_ret"] == b"\x5e\x41\x5f\xc3"
 
     p32 = _gadget_patterns(32, "x86")
     assert p32["int_0x80"] == b"\xcd\x80"

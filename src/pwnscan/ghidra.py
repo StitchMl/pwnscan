@@ -175,7 +175,10 @@ def export_headless(target: Path, home: Optional[Path] = None, script: Optional[
             str(output), "-deleteProject",
         ]
         try:
-            completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=environment)
+            completed = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False, env=environment,
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             output.unlink(missing_ok=True)
             raise GhidraError("Ghidra headless failed: %s" % exc) from exc

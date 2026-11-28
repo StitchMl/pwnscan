@@ -54,8 +54,21 @@ public class PwnscanExport extends GhidraScript {
             Varnode input = operation.getInput(index);
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("kind", input.isConstant() ? "constant" : "dynamic");
-            if (input.isConstant()) item.put("value", input.getOffset());
-            else item.put("repr", input.toString());
+            if (input.isConstant()) {
+                item.put("value", input.getOffset());
+            } else {
+                item.put("repr", input.toString());
+                try {
+                    if (input.getHigh() != null && input.getHigh().getName() != null) {
+                        String highName = input.getHigh().getName();
+                        if (!highName.isEmpty() && !"UNNAMED".equals(highName) && !"null".equals(highName)) {
+                            item.put("high_name", highName);
+                        }
+                    }
+                } catch (RuntimeException ignored) {
+                    // High variables are optional decompiler metadata.
+                }
+            }
             item.put("size", input.getSize());
             Map<String, Object> nested = expression(input, depth + 1, new HashSet<>(seen));
             if (nested != null) item.put("expression", nested);
@@ -63,6 +76,25 @@ public class PwnscanExport extends GhidraScript {
         }
         result.put("inputs", inputs);
         return result;
+    }
+
+    private long signedConstant(Varnode node) {
+        long value = node.getOffset();
+        int bits = node.getSize() * 8;
+        if (bits > 0 && bits < 64 && (value & (1L << (bits - 1))) != 0) {
+            value -= 1L << bits;
+        }
+        return value;
+    }
+
+    private Long baseStackOffset(Program program, Varnode base, Set<String> seen) {
+        if (base == null) return null;
+        Register baseReg = program.getRegister(base);
+        Register stackReg = program.getCompilerSpec().getStackPointer();
+        if (baseReg != null && stackReg != null && baseReg.equals(stackReg)) {
+            return 0L;
+        }
+        return stackOffset(program, base, seen);
     }
 
     private Long stackOffset(Program program, Varnode node, Set<String> seen) {
@@ -75,21 +107,33 @@ public class PwnscanExport extends GhidraScript {
         if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST || opcode == PcodeOp.INDIRECT) {
             return stackOffset(program, operation.getInput(0), seen);
         }
-        if (opcode == PcodeOp.PTRSUB || opcode == PcodeOp.PTRADD) {
+        if (opcode == PcodeOp.PTRSUB && operation.getNumInputs() >= 2) {
             Varnode base = operation.getInput(0);
             Varnode offset = operation.getInput(1);
-            Address baseAddress = base == null ? null : base.getAddress();
-            Register baseReg = base == null ? null : program.getRegister(base);
-            Register stackReg = program.getCompilerSpec().getStackPointer();
-            boolean stackBase = (baseAddress != null && baseAddress.isStackAddress())
-                || (baseReg != null && stackReg != null && baseReg.equals(stackReg));
-            if (offset != null && offset.isConstant() && stackBase) {
-                long value = offset.getOffset();
-                int bits = offset.getSize() * 8;
-                if (bits > 0 && bits < 64 && (value & (1L << (bits - 1))) != 0) value -= 1L << bits;
-                return value;
+            if (offset == null || !offset.isConstant()) return null;
+            Long baseOff = baseStackOffset(program, base, seen);
+            return baseOff == null ? null : baseOff + signedConstant(offset);
+        }
+        if (opcode == PcodeOp.PTRADD && operation.getNumInputs() >= 3) {
+            Varnode base = operation.getInput(0);
+            Varnode index = operation.getInput(1);
+            Varnode elemSize = operation.getInput(2);
+            if (index == null || !index.isConstant() || elemSize == null || !elemSize.isConstant()) return null;
+            Long baseOff = baseStackOffset(program, base, seen);
+            return baseOff == null ? null : baseOff + signedConstant(index) * elemSize.getOffset();
+        }
+        if (opcode == PcodeOp.INT_ADD && operation.getNumInputs() >= 2) {
+            Varnode lhs = operation.getInput(0);
+            Varnode rhs = operation.getInput(1);
+            if (rhs != null && rhs.isConstant()) {
+                Long baseOff = baseStackOffset(program, lhs, seen);
+                return baseOff == null ? null : baseOff + signedConstant(rhs);
             }
-            return stackOffset(program, base, seen);
+            if (lhs != null && lhs.isConstant()) {
+                Long baseOff = baseStackOffset(program, rhs, seen);
+                return baseOff == null ? null : baseOff + signedConstant(lhs);
+            }
+            return null;
         }
         if (opcode == PcodeOp.MULTIEQUAL) {
             Set<Long> values = new HashSet<>();

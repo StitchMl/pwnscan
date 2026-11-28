@@ -1450,3 +1450,237 @@ def test_exact_ret2win_includes_aligned_x86_64_payload_when_ret_gadget_present()
     assert "aligned_payload_hex=" in chain.attack_vector
     assert "0x401016" in chain.attack_vector
     assert any("16-byte stack alignment" in ev for ev in chain.evidence)
+
+
+def test_intra_block_reachability_orders_by_address_then_seq_order():
+    cfg = {"main": {"blocks": {"0": []}}}
+    calls = [
+        {"from": "00401100", "function": "main", "block": 0, "order": 9, "to": "free", "arguments": [dynamic("ptr")]},
+        {"from": "00401120", "function": "main", "block": 0, "order": 1, "to": "puts", "arguments": [dynamic("ptr")]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls, "cfg": cfg}}))
+    assert any(item.id == "PWN-HEAP-002" for item in findings)
+
+
+def test_bsd_format_sinks_and_filler_order_and_lengths():
+    buf = {"kind": "stack", "stack_offset": -128, "return_address_offset": 128}
+    calls = [
+        {"from": "00401100", "function": "log_err", "to": "fgets", "arguments": [
+            buf, {"kind": "constant", "value": 96}, dynamic("stdin"),
+        ]},
+        {"from": "00401140", "function": "log_err", "to": "errx", "arguments": [
+            {"kind": "constant", "value": 1}, buf,
+        ]},
+        {"from": "00401200", "function": "reversed", "to": "warn", "arguments": [buf]},
+        {"from": "00401240", "function": "reversed", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0}, buf, {"kind": "constant", "value": 64},
+        ]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    fmt = next(item for item in findings if item.id == "PWN-FMT-001")
+    assert any("errx" in ev for ev in fmt.evidence)
+    assert any("warn" in ev for ev in fmt.evidence)
+    assert any("filled by fgets at 00401100 (96 bytes)" in ev for ev in fmt.evidence)
+    assert not any("filled by read at 00401240" in ev for ev in fmt.evidence)
+
+
+def test_exact_ret2win_prefers_primary_win_over_secret_and_checks_fgets_limits():
+    calls = [
+        {"from": "00401100", "function": "vuln", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0},
+            {"kind": "stack", "stack_offset": -32, "buffer_size": 32, "return_address_offset": 40},
+            {"kind": "constant", "value": 48},
+        ]},
+    ]
+    findings = analyze(info(
+        symbols=["load_secret", "win"],
+        mitigations={"nx": True, "pie": False, "stack_canary": False},
+        metadata={
+            "symbol_addresses": {"load_secret": 0x401150, "win": 0x401234},
+            "function_symbols": ["load_secret", "win"],
+            "gadgets": {"ret": [0x401016]},
+            "ghidra": {"calls": calls},
+        },
+    ))
+    chain = next(item for item in findings if item.id == "PWN-FLAG-CHAIN-001")
+    assert "0x401234" in chain.flag_path
+    assert "0x401150" not in chain.flag_path
+    assert "aligned_payload_hex=" not in chain.attack_vector
+
+    fgets_exact = analyze(info(
+        symbols=["win"],
+        mitigations={"nx": True, "pie": False, "stack_canary": False},
+        metadata={
+            "symbol_addresses": {"win": 0x401234},
+            "ghidra": {"calls": [
+                {"from": "00401100", "function": "vuln", "to": "fgets", "arguments": [
+                    {"kind": "stack", "stack_offset": -32, "buffer_size": 32, "return_address_offset": 40},
+                    {"kind": "constant", "value": 48},
+                    dynamic("stdin"),
+                ]},
+            ]},
+        },
+    ))
+    assert not any(item.id == "PWN-FLAG-CHAIN-001" for item in fgets_exact)
+
+    fgets_newline = analyze(info(
+        symbols=["win"],
+        mitigations={"nx": True, "pie": False, "stack_canary": False},
+        metadata={
+            "symbol_addresses": {"win": 0x400a34},
+            "ghidra": {"calls": [
+                {"from": "00401100", "function": "vuln", "to": "fgets", "arguments": [
+                    {"kind": "stack", "stack_offset": -32, "buffer_size": 32, "return_address_offset": 40},
+                    {"kind": "constant", "value": 64},
+                    dynamic("stdin"),
+                ]},
+            ]},
+        },
+    ))
+    assert not any(item.id == "PWN-FLAG-CHAIN-001" for item in fgets_newline)
+
+
+def test_string_import_hints_suppressed_for_dynamic_binary_with_ghidra_calls():
+    suppressed = analyze(info(
+        imports=["puts", "scanf"],
+        metadata={
+            "dynamic": True,
+            "parsed_imports": ["puts"],
+            "string_import_hints": ["scanf"],
+            "ghidra": {"calls": [
+                {"from": "00401100", "function": "main", "to": "puts", "arguments": []},
+            ]},
+        },
+    ))
+    assert not any(item.id == "PWN-BOF-001" for item in suppressed)
+
+    static_kept = analyze(info(
+        imports=["puts", "scanf"],
+        metadata={
+            "dynamic": False,
+            "parsed_imports": ["puts"],
+            "string_import_hints": ["scanf"],
+            "ghidra": {"calls": [
+                {"from": "00401100", "function": "main", "to": "puts", "arguments": []},
+            ]},
+        },
+    ))
+    bof = next(item for item in static_kept if item.id == "PWN-BOF-001")
+    assert bof.severity == "low"
+    assert bof.evidence == ["unverified string hint: scanf"]
+
+
+def test_file_stream_local_high_name_does_not_leak_across_functions_and_tracks_fopen():
+    no_fp = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401100", "function": "close_helper", "to": "fclose", "arguments": [
+            {"kind": "stack", "stack_offset": -24, "high_name": "local_18"},
+        ]},
+        {"from": "00401200", "function": "read_name", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0},
+            {"kind": "stack", "stack_offset": -24, "high_name": "local_18"},
+            {"kind": "constant", "value": 64},
+        ]},
+    ]}}))
+    assert not any(item.id == "PWN-FILE-001" for item in no_fp)
+
+    fopen_only = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401300", "function": "chal", "to": "fopen", "return_var": {"repr": "RAX", "high_name": "fp"}, "arguments": [
+            {"kind": "address_constant", "address": "00402000", "string": "/tmp/x"},
+            {"kind": "address_constant", "address": "00402008", "string": "r"},
+        ]},
+        {"from": "00401340", "function": "chal", "to": "read", "arguments": [
+            {"kind": "constant", "value": 0},
+            {"kind": "dynamic", "repr": "RAX", "high_name": "fp"},
+            {"kind": "constant", "value": 480},
+        ]},
+    ]}}))
+    assert any(item.id == "PWN-FILE-001" for item in fopen_only)
+
+
+def test_heap_chunk_overflow_respects_cfg_and_extended_allocators():
+    cfg = {"main": {"blocks": {"0": [1, 2], "1": [3], "2": [3], "3": []}}}
+    disjoint = analyze(info(metadata={"ghidra": {"cfg": cfg, "calls": [
+        {"from": "00401100", "function": "main", "block": 1, "order": 1, "to": "malloc",
+         "return_var": {"high_name": "buf", "repr": "RAX"}, "arguments": [{"kind": "constant", "value": 16}]},
+        {"from": "00401120", "function": "main", "block": 2, "order": 1, "to": "read",
+         "arguments": [{"kind": "constant", "value": 0}, {"kind": "dynamic", "high_name": "buf", "repr": "RAX"}, {"kind": "constant", "value": 64}]},
+    ]}}))
+    assert not any(item.id == "PWN-HEAP-003" for item in disjoint)
+
+    extended = analyze(info(metadata={"ghidra": {"calls": [
+        {"from": "00401200", "function": "cpp", "order": 1, "to": "operator new",
+         "return_var": {"high_name": "obj", "repr": "RAX"}, "arguments": [{"kind": "constant", "value": 24}]},
+        {"from": "00401220", "function": "cpp", "order": 2, "to": "memcpy",
+         "arguments": [{"kind": "dynamic", "high_name": "obj", "repr": "RAX"}, dynamic("src"), {"kind": "constant", "value": 48}]},
+        {"from": "00401300", "function": "reassigned", "order": 1, "to": "aligned_alloc",
+         "return_var": {"high_name": "s", "repr": "RAX"}, "arguments": [{"kind": "constant", "value": 16}, {"kind": "constant", "value": 16}]},
+        {"from": "00401320", "function": "reassigned", "order": 2, "to": "strdup",
+         "return_var": {"high_name": "s", "repr": "RAX"}, "arguments": [dynamic("inp")]},
+        {"from": "00401340", "function": "reassigned", "order": 3, "to": "read",
+         "arguments": [{"kind": "constant", "value": 0}, {"kind": "dynamic", "high_name": "s", "repr": "RAX"}, {"kind": "constant", "value": 64}]},
+    ]}}))
+    heap_ovf = next(item for item in extended if item.id == "PWN-HEAP-003")
+    assert any("in cpp" in ev for ev in heap_ovf.evidence)
+    assert not any("in reassigned" in ev for ev in heap_ovf.evidence)
+
+
+def test_intra_function_reloaded_global_heap_uaf_and_double_free():
+    def load_global(unique_repr):
+        return {
+            "kind": "dynamic",
+            "repr": unique_repr,
+            "expression": {
+                "op": "LOAD",
+                "size": 8,
+                "inputs": [
+                    {"kind": "constant", "value": 0x1b1},
+                    {"kind": "address_constant", "address": "00404080", "writable": True},
+                ],
+            },
+        }
+
+    calls = [
+        {"from": "00401100", "function": "main", "to": "free", "arguments": [load_global("(unique, 0x100, 8)")]},
+        {"from": "00401120", "function": "main", "to": "puts", "arguments": [load_global("(unique, 0x200, 8)")]},
+        {"from": "00401140", "function": "main", "to": "free", "arguments": [load_global("(unique, 0x300, 8)")]},
+    ]
+    findings = analyze(info(metadata={"ghidra": {"calls": calls}}))
+    double_free = next(item for item in findings if item.id == "PWN-HEAP-001")
+    uaf = next(item for item in findings if item.id == "PWN-HEAP-002")
+    assert any("global:00404080" in ev for ev in double_free.evidence)
+    assert any("global:00404080" in ev for ev in uaf.evidence)
+
+
+def test_scanf_posix_m_modifier_is_bounded_and_wide_char_conversion_is_checked():
+    ms_bounded = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401100", "function": "main", "to": "__isoc99_scanf", "arguments": [
+                {"kind": "address_constant", "address": "00402000", "writable": False, "string": "%ms"},
+                {"kind": "stack", "stack_offset": -16, "buffer_size": 8},
+            ]},
+        ]}},
+    ))
+    assert not any(item.id == "PWN-BOF-001" for item in ms_bounded)
+
+    wide_c_overflow = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401100", "function": "main", "to": "__isoc99_scanf", "arguments": [
+                {"kind": "address_constant", "address": "00402000", "writable": False, "string": "%64c"},
+                {"kind": "stack", "stack_offset": -16, "buffer_size": 16},
+            ]},
+        ]}},
+    ))
+    assert any(item.id == "PWN-BOF-001" for item in wide_c_overflow)
+
+    exact_c_safe = analyze(info(
+        imports=["__isoc99_scanf"],
+        metadata={"parsed_imports": ["__isoc99_scanf"], "ghidra": {"calls": [
+            {"from": "00401100", "function": "main", "to": "__isoc99_scanf", "arguments": [
+                {"kind": "address_constant", "address": "00402000", "writable": False, "string": "%16c"},
+                {"kind": "stack", "stack_offset": -16, "buffer_size": 16},
+            ]},
+        ]}},
+    ))
+    assert not any(item.id == "PWN-BOF-001" for item in exact_c_safe)
